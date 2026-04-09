@@ -1,5 +1,5 @@
 {
-  "data_dir": "C:/Users/jembo/UTS/BeeSafe/data",
+  "data_dir": "data",
   "totals": {
     "files": 4,
     "samples": 27018,
@@ -15,7 +15,7 @@
   },
   "files": [
     {
-      "file": "C:/Users/jembo/UTS/BeeSafe/data/gt.csv",
+      "file": "gt.csv",
       "samples": 13509,
       "bbox_samples": 3947,
       "bbox_ratio": 0.29217558664593973,
@@ -28,7 +28,7 @@
       "missing_image_paths": 0
     },
     {
-      "file": "C:/Users/jembo/UTS/BeeSafe/data/test/gt_one.csv",
+      "file": "test/gt_one.csv",
       "samples": 3408,
       "bbox_samples": 942,
       "bbox_ratio": 0.2764084507042254,
@@ -41,7 +41,7 @@
       "missing_image_paths": 0
     },
     {
-      "file": "C:/Users/jembo/UTS/BeeSafe/data/train/gt_one.csv",
+      "file": "train/gt_one.csv",
       "samples": 8225,
       "bbox_samples": 2554,
       "bbox_ratio": 0.31051671732522795,
@@ -54,7 +54,7 @@
       "missing_image_paths": 0
     },
     {
-      "file": "C:/Users/jembo/UTS/BeeSafe/data/val/gt_one.csv",
+      "file": "val/gt_one.csv",
       "samples": 1876,
       "bbox_samples": 451,
       "bbox_ratio": 0.24040511727078892,

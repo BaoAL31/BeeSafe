@@ -53,7 +53,7 @@ def build_markdown_report(result: Dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def summarize_file(file_path: Path) -> Dict:
+def summarize_file(file_path: Path, data_dir: Path) -> Dict:
     line_count = 0
     labels = Counter()
     bbox_lines = 0
@@ -90,7 +90,7 @@ def summarize_file(file_path: Path) -> Dict:
                 missing_image_paths += 1
 
     return {
-        "file": str(file_path.as_posix()),
+        "file": str(file_path.relative_to(data_dir).as_posix()),
         "samples": line_count,
         "bbox_samples": bbox_lines,
         "bbox_ratio": (bbox_lines / line_count) if line_count else 0.0,
@@ -149,7 +149,7 @@ def main() -> None:
     if not files:
         raise FileNotFoundError(f"No files matching gt*.csv found in: {data_dir}")
 
-    per_file = [summarize_file(file_path) for file_path in files]
+    per_file = [summarize_file(file_path, data_dir) for file_path in files]
 
     totals = {
         "files": len(per_file),
@@ -170,7 +170,7 @@ def main() -> None:
     )
 
     result = {
-        "data_dir": str(data_dir.as_posix()),
+        "data_dir": str(data_dir.name),
         "totals": totals,
         "files": per_file,
     }
