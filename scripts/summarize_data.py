@@ -118,20 +118,29 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("data_summary.json"),
-        help="Where to write summary JSON (default: data_summary.json)",
+        default=Path("data/data_summary.json"),
+        help="Where to write summary JSON (default: data/data_summary.json)",
     )
     parser.add_argument(
         "--md-output",
         type=Path,
-        default=Path("data_summary.md"),
-        help="Where to write Markdown report (default: data_summary.md)",
+        default=Path("data/data_summary.md"),
+        help="Where to write summary Markdown (default: data/data_summary.md)",
     )
+
     args = parser.parse_args()
 
     data_dir = args.data_dir.resolve()
     output_path = args.output.resolve()
     md_output_path = args.md_output.resolve()
+
+    if output_path.is_dir():
+        output_path = output_path / "data_summary.json"
+    if md_output_path.is_dir():
+        md_output_path = md_output_path / "data_summary.md"
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    md_output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if not data_dir.exists():
         raise FileNotFoundError(f"Data directory not found: {data_dir}")
