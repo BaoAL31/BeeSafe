@@ -41,7 +41,7 @@ def build_markdown_report(result: Dict) -> str:
     )
 
     for item in result["files"]:
-        labels_text = ", ".join(
+        labels_text = "<br>".join(
             f"{label}:{count}" for label, count in item["labels"].items()
         )
         lines.append(
