@@ -7,6 +7,52 @@ from pathlib import Path
 from typing import Dict, List
 
 
+def build_markdown_report(result: Dict) -> str:
+    totals = result["totals"]
+    lines = [
+        "# BeeSafe Data Summary",
+        "",
+        f"- Data directory: `{result['data_dir']}`",
+        f"- Files: **{totals['files']}**",
+        f"- Samples: **{totals['samples']}**",
+        f"- BBox samples: **{totals['bbox_samples']}** ({totals['bbox_ratio']:.2%})",
+        f"- Malformed lines: **{totals['malformed_lines']}**",
+        f"- Missing image paths: **{totals['missing_image_paths']}**",
+        "",
+        "## Label Distribution (Overall)",
+        "",
+        "| Label | Count | Ratio |",
+        "|---:|---:|---:|",
+    ]
+
+    total_samples = totals["samples"] or 1
+    for label, count in totals["labels"].items():
+        ratio = count / total_samples
+        lines.append(f"| {label} | {count} | {ratio:.2%} |")
+
+    lines.extend(
+        [
+            "",
+            "## Per-File Breakdown",
+            "",
+            "| File | Samples | BBox Samples | BBox Ratio | Malformed | Missing Images | Labels |",
+            "|---|---:|---:|---:|---:|---:|---|",
+        ]
+    )
+
+    for item in result["files"]:
+        labels_text = ", ".join(
+            f"{label}:{count}" for label, count in item["labels"].items()
+        )
+        lines.append(
+            f"| `{item['file']}` | {item['samples']} | {item['bbox_samples']} | "
+            f"{item['bbox_ratio']:.2%} | {item['malformed_lines']} | "
+            f"{item['missing_image_paths']} | {labels_text} |"
+        )
+
+    return "\n".join(lines) + "\n"
+
+
 def summarize_file(file_path: Path) -> Dict:
     line_count = 0
     labels = Counter()
@@ -75,10 +121,17 @@ def main() -> None:
         default=Path("data_summary.json"),
         help="Where to write summary JSON (default: data_summary.json)",
     )
+    parser.add_argument(
+        "--md-output",
+        type=Path,
+        default=Path("data_summary.md"),
+        help="Where to write Markdown report (default: data_summary.md)",
+    )
     args = parser.parse_args()
 
     data_dir = args.data_dir.resolve()
     output_path = args.output.resolve()
+    md_output_path = args.md_output.resolve()
 
     if not data_dir.exists():
         raise FileNotFoundError(f"Data directory not found: {data_dir}")
@@ -114,7 +167,9 @@ def main() -> None:
     }
 
     output_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    md_output_path.write_text(build_markdown_report(result), encoding="utf-8")
     print(f"Summary written to: {output_path}")
+    print(f"Markdown report written to: {md_output_path}")
     print(
         f"Files: {totals['files']} | Samples: {totals['samples']} | "
         f"BBox samples: {totals['bbox_samples']} ({totals['bbox_ratio']:.2%})"
