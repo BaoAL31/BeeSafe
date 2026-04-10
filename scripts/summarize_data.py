@@ -141,6 +141,23 @@ def draw_sample_image(
 _READ_ERRORS = (OSError, ValueError, UnidentifiedImageError)
 
 
+def split_intro_lines(result: Dict) -> List[str]:
+    by_file = {item["file"]: item["samples"] for item in result.get("files", [])}
+    n_train = by_file.get("train/gt_one.csv")
+    n_val = by_file.get("val/gt_one.csv")
+    n_test = by_file.get("test/gt_one.csv")
+    if n_train is None or n_val is None or n_test is None:
+        return []
+    total = result["totals"]["samples"]
+    return [
+        "The annotations are split into three subsets: **train**, **validation**, and **test** "
+        f"(`train/gt_one.csv`: {n_train} samples; `val/gt_one.csv`: {n_val}; "
+        f"`test/gt_one.csv`: {n_test}). The full list of all samples is in `gt.csv` "
+        f"({total} samples).",
+        "",
+    ]
+
+
 def build_markdown_report(result: Dict) -> str:
     totals = result["totals"]
     label_meanings = result.get("label_meanings", {})
@@ -150,6 +167,7 @@ def build_markdown_report(result: Dict) -> str:
     lines = [
         "# BeeSafe Data Summary",
         "",
+        *split_intro_lines(result),
         f"- **Total samples:** {samples}",
         f"- **Samples with bounding boxes:** {bbox_n} ({bbox_pct:.2%} of total)",
         "",
@@ -196,16 +214,24 @@ def build_markdown_report(result: Dict) -> str:
     visuals = result.get("sample_visuals")
     missing_labs = result.get("sample_visuals_missing_labels") or []
     failed_labs = result.get("sample_visuals_failed_labels") or []
+    samples_enabled = result.get("sample_visuals_enabled", True)
     if visuals is None:
         lines.append("*Sample images were not generated.*")
     elif any("error" in v for v in visuals):
         err = next(v["error"] for v in visuals if "error" in v)
         lines.append(f"*Could not render sample images: {err}*")
     elif not visuals:
-        lines.append(
-            "*No sample images were produced (no matching image files on disk, "
-            "or use `--sample-images 0` to skip this section).*"
-        )
+        if not samples_enabled:
+            lines.append(
+                "*Sample figures were not included (script was run with `--sample-images 0`). "
+                "Run without that flag or use `--sample-images 1` to embed one example per label.*"
+            )
+        else:
+            lines.append(
+                "*No sample images could be rendered: no usable image files were found on disk "
+                "for the chosen rows, or every open/draw attempt failed. Check that image paths "
+                "under `data/` match `gt.csv`.*"
+            )
     else:
         if missing_labs:
             labs = ", ".join(str(x) for x in missing_labs)
