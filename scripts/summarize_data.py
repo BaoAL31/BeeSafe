@@ -144,30 +144,20 @@ _READ_ERRORS = (OSError, ValueError, UnidentifiedImageError)
 def build_markdown_report(result: Dict) -> str:
     totals = result["totals"]
     label_meanings = result.get("label_meanings", {})
-    scanned = result.get("annotation_csv_files_scanned", totals.get("csv_files_used_for_total", 0))
-    dedup_note = result.get("totals_dedup_note")
+    samples = totals["samples"]
+    bbox_n = totals["bbox_samples"]
+    bbox_pct = totals["bbox_ratio"]
     lines = [
         "# BeeSafe Data Summary",
         "",
-        f"- Data directory: `{result['data_dir']}`",
-        f"- Annotation CSV files scanned: **{scanned}**",
-        f"- CSV files used for dataset total: **{totals['csv_files_used_for_total']}**",
-        f"- Dataset total samples (deduplicated): **{totals['samples']}**",
-        f"- Rows with bounding boxes (label > 0): **{totals['bbox_samples']}** ({totals['bbox_ratio']:.2%})",
-        f"- Malformed lines: **{totals['malformed_lines']}**",
-        f"- Missing image paths: **{totals['missing_image_paths']}**",
-    ]
-    if dedup_note:
-        lines.append(f"- Note: {dedup_note}")
-    lines.extend(
-        [
+        f"- **Total samples:** {samples}",
+        f"- **Samples with bounding boxes:** {bbox_n} ({bbox_pct:.2%} of total)",
         "",
         "## Label Distribution (Overall)",
         "",
         "| Label | Count | Ratio |",
         "|---:|---:|---:|",
-        ]
-    )
+    ]
 
     total_samples = totals["samples"] or 1
     for label, count in totals["labels"].items():
@@ -372,12 +362,12 @@ def render_sample_visuals(
         nbox = len(row["boxes"])
         if nbox:
             cap = (
-                f"`{row['image_rel']}` — class **{row['label']}** — "
+                f"`{row['image_rel']}` - class **{row['label']}** - "
                 f"{nbox} box(es)"
             )
         else:
             cap = (
-                f"`{row['image_rel']}` — class **{row['label']}** — "
+                f"`{row['image_rel']}` - class **{row['label']}** - "
                 "negative (no box)"
             )
         out.append(
@@ -552,7 +542,7 @@ def main() -> None:
 
     per_file = [summarize_file(file_path, data_dir) for file_path in files]
 
-    canonical_files, totals_dedup_note = files_for_dataset_totals(data_dir, files)
+    canonical_files, _ = files_for_dataset_totals(data_dir, files)
     per_canonical = [summarize_file(file_path, data_dir) for file_path in canonical_files]
 
     totals = {
@@ -584,9 +574,6 @@ def main() -> None:
     )
 
     result = {
-        "data_dir": str(data_dir.name),
-        "annotation_csv_files_scanned": len(files),
-        "totals_dedup_note": totals_dedup_note,
         "totals": totals,
         "label_meanings": label_meanings,
         "files": per_file,
@@ -601,8 +588,8 @@ def main() -> None:
     print(f"Markdown report written to: {md_output_path}")
     print(
         f"CSV files scanned: {len(files)} | "
-        f"Dataset total samples: {totals['samples']} | "
-        f"BBox-positive rows: {totals['bbox_samples']} ({totals['bbox_ratio']:.2%})"
+        f"Total samples: {totals['samples']} | "
+        f"With bounding boxes: {totals['bbox_samples']} ({totals['bbox_ratio']:.2%})"
     )
     if args.sample_images > 0:
         n_ok = len([v for v in sample_visuals if "error" not in v])

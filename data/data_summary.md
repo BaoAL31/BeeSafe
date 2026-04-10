@@ -1,13 +1,7 @@
 # BeeSafe Data Summary
 
-- Data directory: `data`
-- Annotation CSV files scanned: **4**
-- CSV files used for dataset total: **1**
-- Dataset total samples (deduplicated): **13509**
-- Rows with bounding boxes (label > 0): **3947** (29.22%)
-- Malformed lines: **0**
-- Missing image paths: **0**
-- Note: `gt.csv` is the full dataset; `train|test|val/gt_one.csv` are the same samples split into subsets. Global totals use `gt.csv` only so counts match the official 13,509 figure.
+- **Total samples:** 13509
+- **Samples with bounding boxes:** 3947 (29.22% of total)
 
 ## Label Distribution (Overall)
 
@@ -34,20 +28,4 @@
 
 ## Sample images (one per label)
 
-### Label 1
-
-![Label 1](examples/sample_01.png)
-
-*`test/videos/2017-10-17_1-39-36/2017-10-17_1-39-36.mp4-bee_id_5908-65985-1.png` — class **1** — 1 box(es)*
-
-### Label 3
-
-![Label 3](examples/sample_02.png)
-
-*`train/videos/2017-08-28_09-30-00-1_500_dirty_glass/2017-08-28_09-30-00-1_500_dirty_glass.mp4-bee_id_7133-32115-1.png` — class **3** — 1 box(es)*
-
-### Label 0
-
-![Label 0](examples/sample_03.png)
-
-*`val/videos/2017-09-01_3-01-01/2017-09-01_3-01-01.mp4-bee_id_2454-60900-1.png` — class **0** — negative (no box)*
+*No sample images were produced (no matching image files on disk, or use `--sample-images 0` to skip this section).*
