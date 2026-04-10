@@ -161,21 +161,26 @@ def split_intro_lines(result: Dict) -> List[str]:
 def build_markdown_report(result: Dict) -> str:
     totals = result["totals"]
     label_meanings = result.get("label_meanings", {})
-    samples = totals["samples"]
-    bbox_n = totals["bbox_samples"]
-    bbox_pct = totals["bbox_ratio"]
     lines = [
         "# BeeSafe Data Summary",
         "",
         *split_intro_lines(result),
-        f"- **Total samples:** {samples}",
-        f"- **Samples with bounding boxes:** {bbox_n} ({bbox_pct:.2%} of total)",
+        "## Per-File Breakdown",
         "",
-        "## Label Distribution (Overall)",
-        "",
-        "| Label | Count | Ratio |",
-        "|---:|---:|---:|",
+        "| File | Samples | BBox Samples | Labels |",
+        "|---|---:|---:|---|",
     ]
+
+    for item in result["files"]:
+        labels_text = "<br>".join(
+            f"{label}:{count}" for label, count in item["labels"].items()
+        )
+        lines.append(
+            f"| `{item['file']}` | {item['samples']} | {item['bbox_samples']} | "
+            f"{labels_text} |"
+        )
+
+    lines.extend(["", "## Label Distribution (Overall)", "", "| Label | Count | Ratio |", "|---:|---:|---:|"])
 
     total_samples = totals["samples"] or 1
     for label, count in totals["labels"].items():
@@ -189,27 +194,11 @@ def build_markdown_report(result: Dict) -> str:
     else:
         lines.append("- No label meanings provided.")
 
-    lines.extend(
-        [
-            "",
-            "## Per-File Breakdown",
-            "",
-            "| File | Samples | BBox Samples | BBox Ratio | Malformed | Missing Images | Labels |",
-            "|---|---:|---:|---:|---:|---:|---|",
-        ]
-    )
-
-    for item in result["files"]:
-        labels_text = "<br>".join(
-            f"{label}:{count}" for label, count in item["labels"].items()
-        )
-        lines.append(
-            f"| `{item['file']}` | {item['samples']} | {item['bbox_samples']} | "
-            f"{item['bbox_ratio']:.2%} | {item['malformed_lines']} | "
-            f"{item['missing_image_paths']} | {labels_text} |"
-        )
-
-    lines.extend(["", "## Sample images (one per label)", ""])
+    spi = int(result.get("sample_images_per_label") or 0)
+    if spi > 0:
+        lines.extend(["", f"## Sample images ({spi} per infected label)", ""])
+    else:
+        lines.extend(["", "## Sample images", ""])
 
     visuals = result.get("sample_visuals")
     missing_labs = result.get("sample_visuals_missing_labels") or []
@@ -224,7 +213,7 @@ def build_markdown_report(result: Dict) -> str:
         if not samples_enabled:
             lines.append(
                 "*Sample figures were not included (script was run with `--sample-images 0`). "
-                "Run without that flag or use `--sample-images 1` to embed one example per label.*"
+                "Run with `--sample-images N` (N >= 1) to embed N random examples per label.*"
             )
         else:
             lines.append(
@@ -247,18 +236,24 @@ def build_markdown_report(result: Dict) -> str:
                 "images failed to open or draw); those labels are omitted below.*"
             )
             lines.append("")
-        for v in visuals:
+        i = 0
+        while i < len(visuals):
+            v = visuals[i]
             if "error" in v:
+                i += 1
                 continue
-            cap = v["caption"]
-            rel = v["file"]
             lb = v["label"]
             lines.append(f"### Label {lb}")
             lines.append("")
-            lines.append(f"![Label {lb}]({rel})")
-            lines.append("")
-            lines.append(f"*{cap}*")
-            lines.append("")
+            while i < len(visuals) and "error" not in visuals[i] and visuals[i]["label"] == lb:
+                v = visuals[i]
+                cap = v["caption"]
+                rel = v["file"]
+                lines.append(f"![Label {lb}]({rel})")
+                lines.append("")
+                lines.append(f"*{cap}*")
+                lines.append("")
+                i += 1
 
     return "\n".join(lines).rstrip() + "\n"
 
@@ -301,13 +296,16 @@ def render_sample_visuals(
     samples_dir: Path,
     enabled: bool,
     seed: int,
+    per_label: int,
 ) -> tuple[List[Dict], List[int], List[int]]:
     if not enabled:
         return [], [], []
+    if per_label < 1:
+        per_label = 1
 
     # One manifest avoids duplicate rows; paths are always data_dir / <path in CSV>
     rows = rows_for_visual_sampling(data_dir, gt_paths)
-    labels_in_ann = {r["label"] for r in rows}
+    labels_in_ann = {r["label"] for r in rows if r["label"] != 0}
     by_label_rows: Dict[int, List[Dict]] = defaultdict(list)
     for r in rows:
         by_label_rows[r["label"]].append(r)
@@ -334,7 +332,7 @@ def render_sample_visuals(
         )
 
     rng = random.Random(seed)
-    preferred_order = (1, 3, 0)
+    preferred_order = (1, 3)
     target_labels = [lb for lb in preferred_order if lb in labels_in_ann]
     for lb in sorted(labels_in_ann):
         if lb not in target_labels:
@@ -345,67 +343,79 @@ def render_sample_visuals(
 
     for label in target_labels:
         pool = [r for r in rows if r["label"] == label]
-        if label in (1, 3):
-            pool = [r for r in pool if r["boxes"] and r["abs_image"].exists()]
-        else:
-            pool = [r for r in pool if r["abs_image"].exists()]
+        pool = [r for r in pool if r["abs_image"].exists()]
+        # Prioritize infected rows without bboxes, then fall back to rows with bboxes.
+        no_bbox = [r for r in pool if not r["boxes"]]
+        with_bbox = [r for r in pool if r["boxes"]]
+        rng.shuffle(no_bbox)
+        rng.shuffle(with_bbox)
+        pool = no_bbox + with_bbox
         pool = dedupe_rows_by_image_path(pool)
-        rng.shuffle(pool)
 
         if not pool:
             if label not in missing_labels:
                 failed_labels.append(label)
-                if label in (1, 3):
-                    print(
-                        f"  Label {label}: no row with image on disk and at least one bbox.",
-                        file=sys.stderr,
-                    )
+                print(
+                    f"  Label {label}: no row with image on disk.",
+                    file=sys.stderr,
+                )
             continue
 
-        out_path = samples_dir / f"sample_{len(out) + 1:02d}.png"
-        row_ok: Optional[Dict] = None
+        used_keys: set[str] = set()
+        successes = 0
         first_err: Optional[BaseException] = None
         for row in pool:
+            if successes >= per_label:
+                break
+            key = str(row["abs_image"].resolve())
+            if key in used_keys:
+                continue
+            used_keys.add(key)
+            out_path = samples_dir / f"sample_{len(out) + 1:02d}.png"
             try:
                 draw_sample_image(row, out_path)
-                row_ok = row
-                break
             except _READ_ERRORS as e:
                 if first_err is None:
                     first_err = e
                 continue
-        if row_ok is None:
+
+            rel = str(out_path.resolve().relative_to(md_parent).as_posix())
+            nbox = len(row["boxes"])
+            if nbox:
+                cap = (
+                    f"`{row['image_rel']}` - class **{row['label']}** - "
+                    f"{nbox} box(es)"
+                )
+            else:
+                cap = (
+                    f"`{row['image_rel']}` - class **{row['label']}** - "
+                    "infected sample with no box"
+                )
+            out.append(
+                {
+                    "file": rel,
+                    "caption": cap,
+                    "label": row["label"],
+                    "boxes": row["boxes"],
+                    "source_csv": row["csv_rel"],
+                    "image_rel": row["image_rel"],
+                }
+            )
+            successes += 1
+
+        if successes == 0:
             failed_labels.append(label)
             print(
                 f"  Label {label}: tried {len(pool)} image(s); "
                 f"example error: {type(first_err).__name__}: {first_err}",
                 file=sys.stderr,
             )
-            continue
-
-        row = row_ok
-        rel = str(out_path.resolve().relative_to(md_parent).as_posix())
-        nbox = len(row["boxes"])
-        if nbox:
-            cap = (
-                f"`{row['image_rel']}` - class **{row['label']}** - "
-                f"{nbox} box(es)"
+        elif successes < per_label:
+            print(
+                f"  Label {label}: rendered {successes}/{per_label} "
+                "(not enough distinct usable images in the pool).",
+                file=sys.stderr,
             )
-        else:
-            cap = (
-                f"`{row['image_rel']}` - class **{row['label']}** - "
-                "negative (no box)"
-            )
-        out.append(
-            {
-                "file": rel,
-                "caption": cap,
-                "label": row["label"],
-                "boxes": row["boxes"],
-                "source_csv": row["csv_rel"],
-                "image_rel": row["image_rel"],
-            }
-        )
 
     return out, missing_labels, failed_labels
 
@@ -455,6 +465,32 @@ def summarize_file(file_path: Path, data_dir: Path) -> Dict:
         "malformed_lines": malformed_lines,
         "missing_image_paths": missing_image_paths,
     }
+
+
+def summarize_infected_bbox_stats(file_paths: List[Path]) -> Tuple[int, int]:
+    """
+    Count infected rows (label != 0) with and without bbox coordinates.
+    """
+    infected_with_bbox = 0
+    infected_without_bbox = 0
+    for file_path in file_paths:
+        with file_path.open("r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                try:
+                    _, label, boxes = parse_gt_line(parts)
+                except (ValueError, IndexError):
+                    continue
+                if label == 0:
+                    continue
+                if boxes:
+                    infected_with_bbox += 1
+                else:
+                    infected_without_bbox += 1
+    return infected_with_bbox, infected_without_bbox
 
 
 def collect_data_files(data_dir: Path) -> List[Path]:
@@ -516,8 +552,8 @@ def main() -> None:
         "--sample-images",
         type=int,
         default=1,
-        help="0 to skip sample figures; any positive value renders one random sample "
-        "per distinct label (default: 1).",
+        help="0 skips sample figures. N >= 1 renders N random examples per class label "
+        "(default: 1).",
     )
     parser.add_argument(
         "--samples-dir",
@@ -588,6 +624,9 @@ def main() -> None:
     totals["bbox_ratio"] = (
         totals["bbox_samples"] / totals["samples"] if totals["samples"] else 0.0
     )
+    inf_with_bbox, inf_without_bbox = summarize_infected_bbox_stats(canonical_files)
+    totals["infected_with_bbox"] = inf_with_bbox
+    totals["infected_without_bbox"] = inf_without_bbox
     label_meanings = parse_label_meanings(args.label_meanings)
 
     sample_visuals, missing_label_list, failed_label_list = render_sample_visuals(
@@ -597,13 +636,14 @@ def main() -> None:
         samples_dir,
         args.sample_images > 0,
         args.sample_seed,
+        max(1, args.sample_images),
     )
 
     result = {
         "totals": totals,
         "label_meanings": label_meanings,
         "files": per_file,
-        "sample_visuals_mode": "one_per_label",
+        "sample_images_per_label": args.sample_images,
         "sample_visuals_enabled": args.sample_images > 0,
         "sample_visuals_missing_labels": missing_label_list,
         "sample_visuals_failed_labels": failed_label_list,
@@ -615,12 +655,14 @@ def main() -> None:
     print(
         f"CSV files scanned: {len(files)} | "
         f"Total samples: {totals['samples']} | "
-        f"With bounding boxes: {totals['bbox_samples']} ({totals['bbox_ratio']:.2%})"
+        f"With bounding boxes: {totals['bbox_samples']}"
     )
     if args.sample_images > 0:
         n_ok = len([v for v in sample_visuals if "error" not in v])
-        labs = ", ".join(str(v["label"]) for v in sample_visuals if "error" not in v)
-        print(f"Sample images (one per label): {n_ok} rendered [{labs}] -> {samples_dir}")
+        print(
+            f"Sample images: {n_ok} files ({args.sample_images} per label requested) "
+            f"-> {samples_dir}"
+        )
         if missing_label_list:
             ml = ", ".join(str(x) for x in missing_label_list)
             print(f"  Labels with no on-disk image in any row: {ml}")
