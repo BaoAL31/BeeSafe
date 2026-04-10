@@ -1,21 +1,30 @@
 from __future__ import annotations
 
 import argparse
-import json
 import random
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 try:
-    from PIL import Image, ImageDraw, ImageFont  # type: ignore[import-untyped]
+    from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError  # type: ignore[import-untyped]
 except ImportError:
     Image = None  # type: ignore[misc, assignment]
     ImageDraw = None  # type: ignore[misc, assignment]
     ImageFont = None  # type: ignore[misc, assignment]
+    UnidentifiedImageError = OSError  # type: ignore[misc, assignment]
 
 
 BBox = Tuple[int, int, int, int]
+
+
+def _text_pixel_size(text: str, font: object) -> Tuple[int, int]:
+    """Bitmap default fonts do not support ImageDraw.textbbox on some Pillow builds."""
+    if hasattr(font, "getbbox"):
+        x0, y0, x1, y1 = font.getbbox(text)
+        return x1 - x0, y1 - y0
+    return len(text) * 6, 11
 
 
 def parse_gt_line(parts: Sequence[str]) -> Tuple[str, int, List[BBox]]:
@@ -35,106 +44,63 @@ def parse_gt_line(parts: Sequence[str]) -> Tuple[str, int, List[BBox]]:
     return image_path, label, boxes
 
 
+def read_annotation_csv(csv_path: Path, data_dir: Path) -> List[Dict]:
+    rows: List[Dict] = []
+    with csv_path.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            try:
+                image_rel, label, boxes = parse_gt_line(parts)
+            except (ValueError, IndexError):
+                continue
+            abs_img = csv_path.parent / image_rel
+            csv_rel = str(csv_path.relative_to(data_dir).as_posix())
+            rows.append(
+                {
+                    "csv_rel": csv_rel,
+                    "image_rel": image_rel,
+                    "label": label,
+                    "boxes": [list(b) for b in boxes],
+                    "abs_image": abs_img,
+                }
+            )
+    return rows
+
+
 def iter_annotation_rows(
     data_dir: Path, gt_paths: Sequence[Path]
 ) -> List[Dict]:
     rows: List[Dict] = []
     for csv_path in gt_paths:
-        with csv_path.open("r", encoding="utf-8") as f:
-            for raw_line in f:
-                line = raw_line.strip()
-                if not line:
-                    continue
-                parts = line.split()
-                try:
-                    image_rel, label, boxes = parse_gt_line(parts)
-                except (ValueError, IndexError):
-                    continue
-                abs_img = csv_path.parent / image_rel
-                csv_rel = str(csv_path.relative_to(data_dir).as_posix())
-                rows.append(
-                    {
-                        "csv_rel": csv_rel,
-                        "image_rel": image_rel,
-                        "label": label,
-                        "boxes": [list(b) for b in boxes],
-                        "abs_image": abs_img,
-                    }
-                )
+        rows.extend(read_annotation_csv(csv_path, data_dir))
     return rows
 
 
-def _row_key(row: Dict) -> str:
-    return str(row["abs_image"].resolve())
+def rows_for_visual_sampling(data_dir: Path, gt_paths: Sequence[Path]) -> List[Dict]:
+    """
+    Use only data/gt.csv when present so each image path resolves once as
+    data/<path-in-csv>. Split CSVs duplicate the same samples.
+    """
+    data_dir = data_dir.resolve()
+    master = data_dir / "gt.csv"
+    if master.is_file():
+        return read_annotation_csv(master, data_dir)
+    return iter_annotation_rows(data_dir, gt_paths)
 
 
-def pick_visual_samples(
-    rows: List[Dict],
-    max_samples: int,
-    seed: int,
-) -> List[Dict]:
-    rng = random.Random(seed)
-    existing = [r for r in rows if r["abs_image"].exists()]
-    with_bbox = [r for r in existing if r["boxes"]]
-    negatives = [r for r in existing if r["label"] == 0 and not r["boxes"]]
-
-    if not with_bbox and not negatives:
-        return []
-
-    n_neg = min(2, len(negatives), max(0, max_samples // 4))
-    n_pos = max(0, min(len(with_bbox), max_samples - n_neg))
-
+def dedupe_rows_by_image_path(rows: List[Dict]) -> List[Dict]:
     seen: set[str] = set()
-    chosen: List[Dict] = []
-
-    by_label: Dict[int, List[Dict]] = defaultdict(list)
-    for r in with_bbox:
-        by_label[r["label"]].append(r)
-    for lb in by_label:
-        rng.shuffle(by_label[lb])
-    labels = sorted(by_label.keys())
-
-    if labels and n_pos > 0:
-        per = max(1, n_pos // len(labels))
-        for lb in labels:
-            for r in by_label[lb][:per]:
-                if len(chosen) >= n_pos:
-                    break
-                k = _row_key(r)
-                if k in seen:
-                    continue
-                seen.add(k)
-                chosen.append(r)
-            if len(chosen) >= n_pos:
-                break
-
-        pool = [r for r in with_bbox if _row_key(r) not in seen]
-        rng.shuffle(pool)
-        for r in pool:
-            if len(chosen) >= n_pos:
-                break
-            seen.add(_row_key(r))
-            chosen.append(r)
-
-    rng.shuffle(negatives)
-    for r in negatives:
-        if len(chosen) >= max_samples:
-            break
-        k = _row_key(r)
-        if k in seen:
+    out: List[Dict] = []
+    for r in rows:
+        key = str(r["abs_image"].resolve())
+        if key in seen:
             continue
-        seen.add(k)
-        chosen.append(r)
-
-    while len(chosen) < max_samples:
-        pool = [r for r in with_bbox if _row_key(r) not in seen]
-        if not pool:
-            break
-        r = pool.pop(rng.randrange(len(pool)))
-        seen.add(_row_key(r))
-        chosen.append(r)
-
-    return chosen[:max_samples]
+        seen.add(key)
+        out.append(r)
+    return out
 
 
 def draw_sample_image(
@@ -143,57 +109,77 @@ def draw_sample_image(
 ) -> None:
     if Image is None or ImageDraw is None:
         raise RuntimeError("Pillow is required for sample images")
-    img = Image.open(row["abs_image"]).convert("RGB")
-    draw = ImageDraw.Draw(img)
-    label = row["label"]
-    boxes: List[BBox] = [tuple(b) for b in row["boxes"]]
-    palette = {0: "#64748b", 1: "#16a34a", 3: "#ea580c"}
-    color = palette.get(label, "#2563eb")
-
-    font = ImageFont.load_default()
-
-    if boxes:
-        for bi, (x1, y1, x2, y2) in enumerate(boxes):
-            draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
-            text = f"label {label}"
-            bbox = draw.textbbox((0, 0), text, font=font)
-            tw = bbox[2] - bbox[0]
-            th = bbox[3] - bbox[1]
-            tx = x1 + bi * 2
-            ty = max(0, y1 - th - 4)
-            draw.rectangle([tx, ty, tx + tw + 4, ty + th + 2], fill=color)
-            draw.text((tx + 2, ty + 1), text, fill="white", font=font)
-    else:
-        msg = f"label {label} (no box)"
-        draw.rectangle([4, 4, 220, 28], fill="#1e293b")
-        draw.text((8, 8), msg, fill="white", font=font)
-
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    img.save(out_path)
+    with Image.open(row["abs_image"]) as im:
+        im.load()
+        img = im.convert("RGB")
+        draw = ImageDraw.Draw(img)
+        label = row["label"]
+        boxes: List[BBox] = [tuple(b) for b in row["boxes"]]
+        palette = {0: "#64748b", 1: "#16a34a", 3: "#ea580c"}
+        color = palette.get(label, "#2563eb")
+
+        font = ImageFont.load_default()
+
+        if boxes:
+            for bi, (x1, y1, x2, y2) in enumerate(boxes):
+                draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+                text = f"label {label}"
+                tw, th = _text_pixel_size(text, font)
+                tx = x1 + bi * 2
+                ty = max(0, y1 - th - 4)
+                draw.rectangle([tx, ty, tx + tw + 4, ty + th + 2], fill=color)
+                draw.text((tx + 2, ty + 1), text, fill="white", font=font)
+        else:
+            msg = f"label {label} (no box)"
+            draw.rectangle([4, 4, 220, 28], fill="#1e293b")
+            draw.text((8, 8), msg, fill="white", font=font)
+
+        img.save(out_path)
+
+
+_READ_ERRORS = (OSError, ValueError, UnidentifiedImageError)
 
 
 def build_markdown_report(result: Dict) -> str:
     totals = result["totals"]
+    label_meanings = result.get("label_meanings", {})
+    scanned = result.get("annotation_csv_files_scanned", totals.get("csv_files_used_for_total", 0))
+    dedup_note = result.get("totals_dedup_note")
     lines = [
         "# BeeSafe Data Summary",
         "",
         f"- Data directory: `{result['data_dir']}`",
-        f"- Files: **{totals['files']}**",
-        f"- Samples: **{totals['samples']}**",
-        f"- BBox samples: **{totals['bbox_samples']}** ({totals['bbox_ratio']:.2%})",
+        f"- Annotation CSV files scanned: **{scanned}**",
+        f"- CSV files used for dataset total: **{totals['csv_files_used_for_total']}**",
+        f"- Dataset total samples (deduplicated): **{totals['samples']}**",
+        f"- Rows with bounding boxes (label > 0): **{totals['bbox_samples']}** ({totals['bbox_ratio']:.2%})",
         f"- Malformed lines: **{totals['malformed_lines']}**",
         f"- Missing image paths: **{totals['missing_image_paths']}**",
+    ]
+    if dedup_note:
+        lines.append(f"- Note: {dedup_note}")
+    lines.extend(
+        [
         "",
         "## Label Distribution (Overall)",
         "",
         "| Label | Count | Ratio |",
         "|---:|---:|---:|",
-    ]
+        ]
+    )
 
     total_samples = totals["samples"] or 1
     for label, count in totals["labels"].items():
         ratio = count / total_samples
         lines.append(f"| {label} | {count} | {ratio:.2%} |")
+
+    lines.extend(["", "## Label Meanings", ""])
+    if label_meanings:
+        for label in sorted(int(k) for k in label_meanings.keys()):
+            lines.append(f"- `{label}`: {label_meanings[str(label)]}")
+    else:
+        lines.append("- No label meanings provided.")
 
     lines.extend(
         [
@@ -215,10 +201,11 @@ def build_markdown_report(result: Dict) -> str:
             f"{item['missing_image_paths']} | {labels_text} |"
         )
 
-    lines.extend(["", "## Sample images (boxes + labels)", ""])
+    lines.extend(["", "## Sample images (one per label)", ""])
 
-    req = int(result.get("sample_visuals_requested") or 0)
     visuals = result.get("sample_visuals")
+    missing_labs = result.get("sample_visuals_missing_labels") or []
+    failed_labs = result.get("sample_visuals_failed_labels") or []
     if visuals is None:
         lines.append("*Sample images were not generated.*")
     elif any("error" in v for v in visuals):
@@ -227,27 +214,61 @@ def build_markdown_report(result: Dict) -> str:
     elif not visuals:
         lines.append(
             "*No sample images were produced (no matching image files on disk, "
-            "or use `--sample-images N` with N > 0).*"
+            "or use `--sample-images 0` to skip this section).*"
         )
     else:
-        ok_count = len([v for v in visuals if "error" not in v])
-        if req > 0 and ok_count < req:
+        if missing_labs:
+            labs = ", ".join(str(x) for x in missing_labs)
             lines.append(
-                f"*Note: requested **{req}** sample(s); **{ok_count}** could be "
-                "rendered (fewer image files exist locally than annotations reference).*"
+                f"*Note: label(s) **{labs}** appear in annotations but have no "
+                "image file on disk for any row; those labels are omitted below.*"
             )
             lines.append("")
-        for i, v in enumerate(visuals, start=1):
+        if failed_labs:
+            labs = ", ".join(str(x) for x in failed_labs)
+            lines.append(
+                f"*Note: could not render label(s) **{labs}** (all candidate "
+                "images failed to open or draw); those labels are omitted below.*"
+            )
+            lines.append("")
+        for v in visuals:
+            if "error" in v:
+                continue
             cap = v["caption"]
             rel = v["file"]
-            lines.append(f"### Sample {i}")
+            lb = v["label"]
+            lines.append(f"### Label {lb}")
             lines.append("")
-            lines.append(f"![Sample {i}]({rel})")
+            lines.append(f"![Label {lb}]({rel})")
             lines.append("")
             lines.append(f"*{cap}*")
             lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def parse_label_meanings(raw: str) -> Dict[str, str]:
+    """
+    Parse label meanings from: "0=negative,1=class one,3=class three"
+    """
+    mappings: Dict[str, str] = {}
+    for item in raw.split(","):
+        token = item.strip()
+        if not token:
+            continue
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key or not value:
+            continue
+        try:
+            label = int(key)
+        except ValueError:
+            continue
+        mappings[str(label)] = value
+    return mappings
 
 
 def clear_sample_dir(samples_dir: Path) -> None:
@@ -262,44 +283,101 @@ def render_sample_visuals(
     gt_paths: Sequence[Path],
     md_output_path: Path,
     samples_dir: Path,
-    max_samples: int,
+    enabled: bool,
     seed: int,
-) -> List[Dict]:
-    if max_samples <= 0:
-        return []
+) -> tuple[List[Dict], List[int], List[int]]:
+    if not enabled:
+        return [], [], []
 
-    rows = iter_annotation_rows(data_dir, gt_paths)
-    picked = pick_visual_samples(rows, max_samples, seed)
+    # One manifest avoids duplicate rows; paths are always data_dir / <path in CSV>
+    rows = rows_for_visual_sampling(data_dir, gt_paths)
+    labels_in_ann = {r["label"] for r in rows}
+    by_label_rows: Dict[int, List[Dict]] = defaultdict(list)
+    for r in rows:
+        by_label_rows[r["label"]].append(r)
+    missing_labels = sorted(
+        lb
+        for lb in labels_in_ann
+        if not any(x["abs_image"].exists() for x in by_label_rows[lb])
+    )
+
     clear_sample_dir(samples_dir)
     samples_dir.mkdir(parents=True, exist_ok=True)
 
     md_parent = md_output_path.parent.resolve()
 
     if Image is None or ImageDraw is None:
-        return [
-            {
-                "error": "Pillow is not installed; run: pip install -r requirements.txt"
-            }
-        ]
+        return (
+            [
+                {
+                    "error": "Pillow is not installed; run: pip install -r requirements.txt"
+                }
+            ],
+            missing_labels,
+            [],
+        )
+
+    rng = random.Random(seed)
+    preferred_order = (1, 3, 0)
+    target_labels = [lb for lb in preferred_order if lb in labels_in_ann]
+    for lb in sorted(labels_in_ann):
+        if lb not in target_labels:
+            target_labels.append(lb)
 
     out: List[Dict] = []
-    for row in picked:
-        out_path = samples_dir / f"sample_{len(out) + 1:02d}.png"
-        try:
-            draw_sample_image(row, out_path)
-        except (OSError, ValueError):
+    failed_labels: List[int] = []
+
+    for label in target_labels:
+        pool = [r for r in rows if r["label"] == label]
+        if label in (1, 3):
+            pool = [r for r in pool if r["boxes"] and r["abs_image"].exists()]
+        else:
+            pool = [r for r in pool if r["abs_image"].exists()]
+        pool = dedupe_rows_by_image_path(pool)
+        rng.shuffle(pool)
+
+        if not pool:
+            if label not in missing_labels:
+                failed_labels.append(label)
+                if label in (1, 3):
+                    print(
+                        f"  Label {label}: no row with image on disk and at least one bbox.",
+                        file=sys.stderr,
+                    )
             continue
 
+        out_path = samples_dir / f"sample_{len(out) + 1:02d}.png"
+        row_ok: Optional[Dict] = None
+        first_err: Optional[BaseException] = None
+        for row in pool:
+            try:
+                draw_sample_image(row, out_path)
+                row_ok = row
+                break
+            except _READ_ERRORS as e:
+                if first_err is None:
+                    first_err = e
+                continue
+        if row_ok is None:
+            failed_labels.append(label)
+            print(
+                f"  Label {label}: tried {len(pool)} image(s); "
+                f"example error: {type(first_err).__name__}: {first_err}",
+                file=sys.stderr,
+            )
+            continue
+
+        row = row_ok
         rel = str(out_path.resolve().relative_to(md_parent).as_posix())
         nbox = len(row["boxes"])
         if nbox:
             cap = (
-                f"`{row['csv_rel']}` — class **{row['label']}** — "
+                f"`{row['image_rel']}` — class **{row['label']}** — "
                 f"{nbox} box(es)"
             )
         else:
             cap = (
-                f"`{row['csv_rel']}` — class **{row['label']}** — "
+                f"`{row['image_rel']}` — class **{row['label']}** — "
                 "negative (no box)"
             )
         out.append(
@@ -313,7 +391,7 @@ def render_sample_visuals(
             }
         )
 
-    return out
+    return out, missing_labels, failed_labels
 
 
 def summarize_file(file_path: Path, data_dir: Path) -> Dict:
@@ -368,6 +446,40 @@ def collect_data_files(data_dir: Path) -> List[Path]:
     return [p for p in files if p.is_file()]
 
 
+def files_for_dataset_totals(
+    data_dir: Path, all_files: List[Path]
+) -> tuple[List[Path], str]:
+    """
+    Avoid double-counting when both the full manifest (gt.csv) and the
+    train/test/val split files (gt_one.csv) are present: they describe the
+    same samples (VarroaDataset: 8,225 + 3,408 + 1,876 = 13,509).
+    """
+    data_dir = data_dir.resolve()
+    by_resolved = {p.resolve(): p for p in all_files}
+    root_gt = (data_dir / "gt.csv").resolve()
+    split_paths = [
+        (data_dir / "train" / "gt_one.csv").resolve(),
+        (data_dir / "test" / "gt_one.csv").resolve(),
+        (data_dir / "val" / "gt_one.csv").resolve(),
+    ]
+    has_root = root_gt in by_resolved
+    has_all_splits = all(sp in by_resolved for sp in split_paths)
+
+    if has_root and has_all_splits:
+        return [by_resolved[root_gt]], (
+            "`gt.csv` is the full dataset; `train|test|val/gt_one.csv` are the same "
+            "samples split into subsets. Global totals use `gt.csv` only so counts "
+            "match the official 13,509 figure."
+        )
+    if has_root:
+        return [by_resolved[root_gt]], "Global totals use `gt.csv`."
+    if has_all_splits:
+        return [by_resolved[sp] for sp in split_paths], (
+            "No `gt.csv`; global totals sum `train`, `test`, and `val` `gt_one.csv`."
+        )
+    return all_files, "Global totals sum all matched `gt*.csv` files."
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Summarize BeeSafe ground-truth data files and write a report."
@@ -379,12 +491,6 @@ def main() -> None:
         help="Path to data directory (default: data)",
     )
     parser.add_argument(
-        "--output",
-        type=Path,
-        default=Path("data/data_summary.json"),
-        help="Where to write summary JSON (default: data/data_summary.json)",
-    )
-    parser.add_argument(
         "--md-output",
         type=Path,
         default=Path("data/data_summary.md"),
@@ -393,8 +499,9 @@ def main() -> None:
     parser.add_argument(
         "--sample-images",
         type=int,
-        default=8,
-        help="Number of annotated sample images to render (0 to skip). Default: 8",
+        default=1,
+        help="0 to skip sample figures; any positive value renders one random sample "
+        "per distinct label (default: 1).",
     )
     parser.add_argument(
         "--samples-dir",
@@ -409,11 +516,21 @@ def main() -> None:
         default=42,
         help="Random seed for choosing sample images (default: 42)",
     )
+    parser.add_argument(
+        "--label-meanings",
+        type=str,
+        default=(
+            "0=healthy (VarroaDataset class 0),"
+            "1=Varroa-infected (VarroaDataset class 1),"
+            "3=unknown (present in some exports; not defined in official README)"
+        ),
+        help="Comma-separated label meanings. Example: "
+        '"0=healthy,1=Varroa-infected,3=unknown"',
+    )
 
     args = parser.parse_args()
 
     data_dir = args.data_dir.resolve()
-    output_path = args.output.resolve()
     md_output_path = args.md_output.resolve()
     samples_dir = (
         args.samples_dir.resolve()
@@ -421,12 +538,9 @@ def main() -> None:
         else md_output_path.parent / "summary_samples"
     )
 
-    if output_path.is_dir():
-        output_path = output_path / "data_summary.json"
     if md_output_path.is_dir():
         md_output_path = md_output_path / "data_summary.md"
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     md_output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if not data_dir.exists():
@@ -438,16 +552,19 @@ def main() -> None:
 
     per_file = [summarize_file(file_path, data_dir) for file_path in files]
 
+    canonical_files, totals_dedup_note = files_for_dataset_totals(data_dir, files)
+    per_canonical = [summarize_file(file_path, data_dir) for file_path in canonical_files]
+
     totals = {
-        "files": len(per_file),
-        "samples": sum(item["samples"] for item in per_file),
-        "bbox_samples": sum(item["bbox_samples"] for item in per_file),
-        "malformed_lines": sum(item["malformed_lines"] for item in per_file),
-        "missing_image_paths": sum(item["missing_image_paths"] for item in per_file),
+        "csv_files_used_for_total": len(canonical_files),
+        "samples": sum(item["samples"] for item in per_canonical),
+        "bbox_samples": sum(item["bbox_samples"] for item in per_canonical),
+        "malformed_lines": sum(item["malformed_lines"] for item in per_canonical),
+        "missing_image_paths": sum(item["missing_image_paths"] for item in per_canonical),
     }
 
     all_labels = Counter()
-    for item in per_file:
+    for item in per_canonical:
         for label, count in item["labels"].items():
             all_labels[int(label)] += int(count)
 
@@ -455,37 +572,48 @@ def main() -> None:
     totals["bbox_ratio"] = (
         totals["bbox_samples"] / totals["samples"] if totals["samples"] else 0.0
     )
+    label_meanings = parse_label_meanings(args.label_meanings)
 
-    sample_visuals = render_sample_visuals(
+    sample_visuals, missing_label_list, failed_label_list = render_sample_visuals(
         data_dir,
         files,
         md_output_path,
         samples_dir,
-        args.sample_images,
+        args.sample_images > 0,
         args.sample_seed,
     )
 
     result = {
         "data_dir": str(data_dir.name),
+        "annotation_csv_files_scanned": len(files),
+        "totals_dedup_note": totals_dedup_note,
         "totals": totals,
+        "label_meanings": label_meanings,
         "files": per_file,
-        "sample_visuals_requested": args.sample_images,
+        "sample_visuals_mode": "one_per_label",
+        "sample_visuals_enabled": args.sample_images > 0,
+        "sample_visuals_missing_labels": missing_label_list,
+        "sample_visuals_failed_labels": failed_label_list,
         "sample_visuals": sample_visuals,
     }
 
-    output_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     md_output_path.write_text(build_markdown_report(result), encoding="utf-8")
-    print(f"Summary written to: {output_path}")
     print(f"Markdown report written to: {md_output_path}")
     print(
-        f"Files: {totals['files']} | Samples: {totals['samples']} | "
-        f"BBox samples: {totals['bbox_samples']} ({totals['bbox_ratio']:.2%})"
+        f"CSV files scanned: {len(files)} | "
+        f"Dataset total samples: {totals['samples']} | "
+        f"BBox-positive rows: {totals['bbox_samples']} ({totals['bbox_ratio']:.2%})"
     )
     if args.sample_images > 0:
         n_ok = len([v for v in sample_visuals if "error" not in v])
-        print(
-            f"Sample images: {n_ok}/{args.sample_images} rendered -> {samples_dir}"
-        )
+        labs = ", ".join(str(v["label"]) for v in sample_visuals if "error" not in v)
+        print(f"Sample images (one per label): {n_ok} rendered [{labs}] -> {samples_dir}")
+        if missing_label_list:
+            ml = ", ".join(str(x) for x in missing_label_list)
+            print(f"  Labels with no on-disk image in any row: {ml}")
+        if failed_label_list:
+            fl = ", ".join(str(x) for x in failed_label_list)
+            print(f"  Labels skipped (render failed for all candidates): {fl}")
 
 
 if __name__ == "__main__":
