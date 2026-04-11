@@ -19,6 +19,45 @@ except ImportError:
 BBox = Tuple[int, int, int, int]
 
 
+def _label_key_int(k: object) -> int:
+    if isinstance(k, int):
+        return k
+    if isinstance(k, str) and k.strip().isdigit():
+        return int(k.strip())
+    return int(k)  # type: ignore[arg-type]
+
+
+def merged_class_counts(labels: Dict) -> Dict[str, int]:
+    """
+    Collapse legacy classes 1 and 3 into ``infected``; 0 is ``healthy``.
+    Any other label is counted under ``other`` (shown only if non-zero).
+    """
+    healthy = 0
+    infected = 0
+    other = 0
+    for k, v in labels.items():
+        li = _label_key_int(k)
+        if li == 0:
+            healthy += int(v)
+        elif li in (1, 3):
+            infected += int(v)
+        else:
+            other += int(v)
+    out: Dict[str, int] = {"healthy": healthy, "infected": infected}
+    if other:
+        out["other"] = other
+    return out
+
+
+def display_class_name(label: int) -> str:
+    """Human-readable class for overlays and captions (legacy 1 and 3 -> infected)."""
+    if label == 0:
+        return "healthy"
+    if label in (1, 3):
+        return "infected"
+    return f"label {label}"
+
+
 def _text_pixel_size(text: str, font: object) -> Tuple[int, int]:
     """Bitmap default fonts do not support ImageDraw.textbbox on some Pillow builds."""
     if hasattr(font, "getbbox"):
@@ -116,22 +155,23 @@ def draw_sample_image(
         draw = ImageDraw.Draw(img)
         label = row["label"]
         boxes: List[BBox] = [tuple(b) for b in row["boxes"]]
-        palette = {0: "#64748b", 1: "#16a34a", 3: "#ea580c"}
+        palette = {0: "#64748b", 1: "#16a34a", 3: "#16a34a"}
         color = palette.get(label, "#2563eb")
 
         font = ImageFont.load_default()
+        overlay = display_class_name(label)
 
         if boxes:
             for bi, (x1, y1, x2, y2) in enumerate(boxes):
                 draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
-                text = f"label {label}"
+                text = overlay
                 tw, th = _text_pixel_size(text, font)
                 tx = x1 + bi * 2
                 ty = max(0, y1 - th - 4)
                 draw.rectangle([tx, ty, tx + tw + 4, ty + th + 2], fill=color)
                 draw.text((tx + 2, ty + 1), text, fill="white", font=font)
         else:
-            msg = f"label {label} (no box)"
+            msg = f"{overlay} (no box)"
             draw.rectangle([4, 4, 220, 28], fill="#1e293b")
             draw.text((8, 8), msg, fill="white", font=font)
 
@@ -167,36 +207,52 @@ def build_markdown_report(result: Dict) -> str:
         *split_intro_lines(result),
         "## Per-File Breakdown",
         "",
-        "| File | Samples | BBox Samples | Labels |",
-        "|---|---:|---:|---|",
+        "| File | Samples | Labels |",
+        "|---|---:|---|",
     ]
 
     for item in result["files"]:
-        labels_text = "<br>".join(
-            f"{label}:{count}" for label, count in item["labels"].items()
-        )
+        m = merged_class_counts(item["labels"])
+        parts = [f"healthy: {m['healthy']}", f"infected: {m['infected']}"]
+        if m.get("other"):
+            parts.append(f"other:{m['other']}")
+        labels_text = "<br>".join(parts)
         lines.append(
-            f"| `{item['file']}` | {item['samples']} | {item['bbox_samples']} | "
-            f"{labels_text} |"
+            f"| `{item['file']}` | {item['samples']} | {labels_text} |"
         )
 
-    lines.extend(["", "## Label Distribution (Overall)", "", "| Label | Count | Ratio |", "|---:|---:|---:|"])
+    lines.extend(
+        ["", "## Label distribution (overall)", "", "| Class | Count | Ratio |", "|---|---:|---:|"]
+    )
 
     total_samples = totals["samples"] or 1
-    for label, count in totals["labels"].items():
+    merged = merged_class_counts(totals["labels"])
+    for cls in ("healthy", "infected", "other"):
+        if cls not in merged:
+            continue
+        count = merged[cls]
         ratio = count / total_samples
-        lines.append(f"| {label} | {count} | {ratio:.2%} |")
+        lines.append(f"| {cls} | {count} | {ratio:.2%} |")
 
-    lines.extend(["", "## Label Meanings", ""])
+    lines.extend(["", "## Label meanings", ""])
     if label_meanings:
-        for label in sorted(int(k) for k in label_meanings.keys()):
-            lines.append(f"- `{label}`: {label_meanings[str(label)]}")
+        shown: set[str] = set()
+        for key in ("healthy", "infected"):
+            if key in label_meanings:
+                lines.append(f"- **{key}**: {label_meanings[key]}")
+                shown.add(key)
+        rest_keys = sorted(
+            (k for k in label_meanings if k not in shown),
+            key=lambda x: (0, int(x)) if x.isdigit() else (1, x),
+        )
+        for k in rest_keys:
+            lines.append(f"- `{k}`: {label_meanings[k]}")
     else:
         lines.append("- No label meanings provided.")
 
     spi = int(result.get("sample_images_per_label") or 0)
     if spi > 0:
-        lines.extend(["", f"## Sample images ({spi} per infected label)", ""])
+        lines.extend(["", f"## Sample images ({spi} per infected label; legacy 1 and 3)", ""])
     else:
         lines.extend(["", "## Sample images", ""])
 
@@ -236,6 +292,16 @@ def build_markdown_report(result: Dict) -> str:
                 "images failed to open or draw); those labels are omitted below.*"
             )
             lines.append("")
+        def _section_title(lb: int) -> str:
+            return "Healthy" if lb == 0 else "Infected"
+
+        def _same_section(a: int, b: int) -> bool:
+            if a == b:
+                return True
+            if a in (1, 3) and b in (1, 3):
+                return True
+            return False
+
         i = 0
         while i < len(visuals):
             v = visuals[i]
@@ -243,13 +309,16 @@ def build_markdown_report(result: Dict) -> str:
                 i += 1
                 continue
             lb = v["label"]
-            lines.append(f"### Label {lb}")
+            title = _section_title(lb)
+            lines.append(f"### {title}")
             lines.append("")
-            while i < len(visuals) and "error" not in visuals[i] and visuals[i]["label"] == lb:
+            while i < len(visuals) and "error" not in visuals[i] and _same_section(
+                visuals[i]["label"], lb
+            ):
                 v = visuals[i]
                 cap = v["caption"]
                 rel = v["file"]
-                lines.append(f"![Label {lb}]({rel})")
+                lines.append(f"![{title}]({rel})")
                 lines.append("")
                 lines.append(f"*{cap}*")
                 lines.append("")
@@ -260,7 +329,8 @@ def build_markdown_report(result: Dict) -> str:
 
 def parse_label_meanings(raw: str) -> Dict[str, str]:
     """
-    Parse label meanings from: "0=negative,1=class one,3=class three"
+    Parse label meanings from comma-separated ``key=value`` pairs.
+    Keys may be numeric (``0``, ``1``) or names (``healthy``, ``infected``).
     """
     mappings: Dict[str, str] = {}
     for item in raw.split(","):
@@ -274,11 +344,10 @@ def parse_label_meanings(raw: str) -> Dict[str, str]:
         value = value.strip()
         if not key or not value:
             continue
-        try:
-            label = int(key)
-        except ValueError:
-            continue
-        mappings[str(label)] = value
+        if key.isdigit():
+            mappings[str(int(key))] = value
+        else:
+            mappings[key.lower()] = value
     return mappings
 
 
@@ -381,15 +450,18 @@ def render_sample_visuals(
 
             rel = str(out_path.resolve().relative_to(md_parent).as_posix())
             nbox = len(row["boxes"])
+            cls = display_class_name(row["label"])
             if nbox:
                 cap = (
-                    f"`{row['image_rel']}` - class **{row['label']}** - "
+                    f"`{row['image_rel']}` - **{cls}** "
+                    f"(legacy class {row['label']}) - "
                     f"{nbox} box(es)"
                 )
             else:
                 cap = (
-                    f"`{row['image_rel']}` - class **{row['label']}** - "
-                    "infected sample with no box"
+                    f"`{row['image_rel']}` - **{cls}** "
+                    f"(legacy class {row['label']}) - "
+                    "no box"
                 )
             out.append(
                 {
@@ -423,7 +495,6 @@ def render_sample_visuals(
 def summarize_file(file_path: Path, data_dir: Path) -> Dict:
     line_count = 0
     labels = Counter()
-    bbox_lines = 0
     malformed_lines = 0
     missing_image_paths = 0
 
@@ -449,9 +520,6 @@ def summarize_file(file_path: Path, data_dir: Path) -> Dict:
                 malformed_lines += 1
                 continue
 
-            if label > 0:
-                bbox_lines += 1
-
             expected_image = file_path.parent / image_path
             if not expected_image.exists():
                 missing_image_paths += 1
@@ -459,38 +527,10 @@ def summarize_file(file_path: Path, data_dir: Path) -> Dict:
     return {
         "file": str(file_path.relative_to(data_dir).as_posix()),
         "samples": line_count,
-        "bbox_samples": bbox_lines,
-        "bbox_ratio": (bbox_lines / line_count) if line_count else 0.0,
         "labels": dict(sorted(labels.items())),
         "malformed_lines": malformed_lines,
         "missing_image_paths": missing_image_paths,
     }
-
-
-def summarize_infected_bbox_stats(file_paths: List[Path]) -> Tuple[int, int]:
-    """
-    Count infected rows (label != 0) with and without bbox coordinates.
-    """
-    infected_with_bbox = 0
-    infected_without_bbox = 0
-    for file_path in file_paths:
-        with file_path.open("r", encoding="utf-8") as f:
-            for raw_line in f:
-                line = raw_line.strip()
-                if not line:
-                    continue
-                parts = line.split()
-                try:
-                    _, label, boxes = parse_gt_line(parts)
-                except (ValueError, IndexError):
-                    continue
-                if label == 0:
-                    continue
-                if boxes:
-                    infected_with_bbox += 1
-                else:
-                    infected_without_bbox += 1
-    return infected_with_bbox, infected_without_bbox
 
 
 def collect_data_files(data_dir: Path) -> List[Path]:
@@ -552,8 +592,8 @@ def main() -> None:
         "--sample-images",
         type=int,
         default=1,
-        help="0 skips sample figures. N >= 1 renders N random examples per class label "
-        "(default: 1).",
+        help="0 skips sample figures. N >= 1 renders N random infected examples per legacy "
+        "label (1 and 3), shown together as infected (default: 1).",
     )
     parser.add_argument(
         "--samples-dir",
@@ -572,12 +612,11 @@ def main() -> None:
         "--label-meanings",
         type=str,
         default=(
-            "0=healthy (VarroaDataset class 0),"
-            "1=Varroa-infected (VarroaDataset class 1),"
-            "3=unknown (present in some exports; not defined in official README)"
+            "healthy=healthy (VarroaDataset class 0),"
+            "infected=Varroa-infected (legacy classes 1 and 3 combined)"
         ),
-        help="Comma-separated label meanings. Example: "
-        '"0=healthy,1=Varroa-infected,3=unknown"',
+        help="Comma-separated meanings: healthy=..., infected=... "
+        "or legacy numeric keys 0=..., 1=..., 3=...",
     )
 
     args = parser.parse_args()
@@ -610,7 +649,6 @@ def main() -> None:
     totals = {
         "csv_files_used_for_total": len(canonical_files),
         "samples": sum(item["samples"] for item in per_canonical),
-        "bbox_samples": sum(item["bbox_samples"] for item in per_canonical),
         "malformed_lines": sum(item["malformed_lines"] for item in per_canonical),
         "missing_image_paths": sum(item["missing_image_paths"] for item in per_canonical),
     }
@@ -621,12 +659,6 @@ def main() -> None:
             all_labels[int(label)] += int(count)
 
     totals["labels"] = dict(sorted(all_labels.items()))
-    totals["bbox_ratio"] = (
-        totals["bbox_samples"] / totals["samples"] if totals["samples"] else 0.0
-    )
-    inf_with_bbox, inf_without_bbox = summarize_infected_bbox_stats(canonical_files)
-    totals["infected_with_bbox"] = inf_with_bbox
-    totals["infected_without_bbox"] = inf_without_bbox
     label_meanings = parse_label_meanings(args.label_meanings)
 
     sample_visuals, missing_label_list, failed_label_list = render_sample_visuals(
@@ -653,15 +685,13 @@ def main() -> None:
     md_output_path.write_text(build_markdown_report(result), encoding="utf-8")
     print(f"Markdown report written to: {md_output_path}")
     print(
-        f"CSV files scanned: {len(files)} | "
-        f"Total samples: {totals['samples']} | "
-        f"With bounding boxes: {totals['bbox_samples']}"
+        f"CSV files scanned: {len(files)} | Total samples: {totals['samples']}"
     )
     if args.sample_images > 0:
         n_ok = len([v for v in sample_visuals if "error" not in v])
         print(
-            f"Sample images: {n_ok} files ({args.sample_images} per label requested) "
-            f"-> {samples_dir}"
+            f"Sample images: {n_ok} files ({args.sample_images} per infected legacy label "
+            f"requested) -> {samples_dir}"
         )
         if missing_label_list:
             ml = ", ".join(str(x) for x in missing_label_list)
