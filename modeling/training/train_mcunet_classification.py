@@ -20,7 +20,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
-from mcunet.model_zoo import build_model
+from mcunet.model_zoo import build_model, net_id_list
 
 
 def parse_gt_line(line: str) -> Tuple[str, int]:
@@ -170,9 +170,17 @@ def main() -> None:
     parser.add_argument(
         "--net-id",
         type=str,
-        default="mcunet-320kB",
-        help="MCUNet zoo id (e.g. mcunet-320kB, mcunet-5fps, mcunet-512kB, mbv2-320kB). "
-        "Run mcunet.model_zoo.NET_INFO or see mcunet docs for valid names.",
+        default="mcunet-in3",
+        help=(
+            "MCUNet zoo id (upstream names: mcunet-in0..in4, mbv2-w0.35, proxyless-w0.3, "
+            "mcunet-vww0..vww2, person-det). Default mcunet-in3 ≈ 320KB/1MB ImageNet profile. "
+            "Run with --list-net-ids to print ids for your installed mcunet."
+        ),
+    )
+    parser.add_argument(
+        "--list-net-ids",
+        action="store_true",
+        help="Print mcunet.model_zoo.net_id_list and exit.",
     )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -192,6 +200,10 @@ def main() -> None:
         default=Path("checkpoints/mcunet"),
     )
     args = parser.parse_args()
+
+    if args.list_net_ids:
+        print(net_id_list)
+        return
 
     data_dir = args.data_dir.resolve()
     train_csv = data_dir / "train" / "gt_one.csv"

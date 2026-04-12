@@ -41,6 +41,24 @@ def _patched_download_url(
 
 
 def apply_mcunet_download_patch() -> None:
+    """
+    Replace download_url everywhere mcunet keeps a reference (common_tools,
+    utils, model_zoo), and point model_zoo at the current MIT release host.
+    """
     import mcunet.utils.common_tools as ct
 
     ct.download_url = _patched_download_url
+
+    import mcunet.utils as u
+
+    if hasattr(u, "download_url"):
+        u.download_url = _patched_download_url
+
+    import mcunet.model_zoo as mz
+
+    mz.download_url = _patched_download_url
+
+    # Older pip builds use https://hanlab.mit.edu/... which now 404s; upstream
+    # repo uses https://hanlab18.mit.edu/projects/tinyml/mcunet/release/
+    if hasattr(mz, "url_base") and "hanlab18" not in getattr(mz, "url_base", ""):
+        mz.url_base = "https://hanlab18.mit.edu/projects/tinyml/mcunet/release/"
