@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Callable, Dict, List, Sequence, Tuple
@@ -16,6 +17,13 @@ from torchvision import transforms
 from mcunet.model_zoo import build_model, download_tflite, net_id_list
 
 from modeling.training.classification_metrics import infected_recall
+
+
+def _json_float(x: float) -> float | None:
+    """JSON-serializable float; NaN becomes None (strict JSON has no NaN)."""
+    if isinstance(x, float) and math.isnan(x):
+        return None
+    return x
 
 
 def parse_gt_line(line: str) -> Tuple[str, int]:
@@ -163,6 +171,20 @@ def run_epoch(
     preds_cat = torch.cat(all_preds) if all_preds else torch.tensor([], dtype=torch.long)
     labels_cat = torch.cat(all_labels) if all_labels else torch.tensor([], dtype=torch.long)
     inf_rec = infected_recall(preds_cat, labels_cat, binary_infected)
+
+    phase = "train" if is_train else "val  "
+    n_pred_0 = (preds_cat == 0).sum().item()
+    n_pred_1 = (preds_cat == 1).sum().item()
+    n_label_0 = (labels_cat == 0).sum().item()
+    n_label_1 = (labels_cat == 1).sum().item()
+    tp = ((preds_cat == 1) & (labels_cat == 1)).sum().item()
+    fn = ((preds_cat == 0) & (labels_cat == 1)).sum().item()
+    print(
+        f"  [{phase}] labels: 0={n_label_0} 1={n_label_1} | "
+        f"preds: 0={n_pred_0} 1={n_pred_1} | "
+        f"TP={tp} FN={fn} → recall={inf_rec:.4f}"
+    )
+
     return avg_loss, acc, inf_rec
 
 
@@ -327,6 +349,7 @@ def main() -> None:
         tb_log_dir.mkdir(parents=True, exist_ok=True)
         writer = SummaryWriter(log_dir=str(tb_log_dir))
         print(f"TensorBoard log dir: {tb_log_dir.resolve()}")
+        print(f"View: python -m tensorboard --logdir {tb_log_dir.resolve()}")
 
     best_val_inf_rec = -1.0
     best_path = args.save_dir / f"{args.net_id}_best.pt"
@@ -356,13 +379,15 @@ def main() -> None:
             if writer is not None:
                 writer.add_scalar("train/loss", train_loss, epoch)
                 writer.add_scalar("train/accuracy", train_acc, epoch)
-                writer.add_scalar("train/infected_recall", train_inf_rec, epoch)
+                if not math.isnan(train_inf_rec):
+                    writer.add_scalar("train/infected_recall", train_inf_rec, epoch)
                 writer.add_scalar("val/loss", val_loss, epoch)
                 writer.add_scalar("val/accuracy", val_acc, epoch)
-                writer.add_scalar("val/infected_recall", val_inf_rec, epoch)
+                if not math.isnan(val_inf_rec):
+                    writer.add_scalar("val/infected_recall", val_inf_rec, epoch)
                 writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch)
 
-            if val_inf_rec > best_val_inf_rec:
+            if not math.isnan(val_inf_rec) and val_inf_rec > best_val_inf_rec:
                 best_val_inf_rec = val_inf_rec
                 epochs_without_improve = 0
                 ckpt: Dict = {
@@ -381,7 +406,7 @@ def main() -> None:
                         train_counts, torch.device("cpu")
                     ).tolist()
                 torch.save(ckpt, best_path)
-                if writer is not None:
+                if writer is not None and not math.isnan(best_val_inf_rec):
                     writer.add_scalar("best/val_infected_recall", best_val_inf_rec, epoch)
             else:
                 if args.early_stopping_patience > 0:
@@ -402,7 +427,8 @@ def main() -> None:
         if writer is not None:
             writer.add_scalar("test/loss", test_loss, last_epoch)
             writer.add_scalar("test/accuracy", test_acc, last_epoch)
-            writer.add_scalar("test/infected_recall", test_inf_rec, last_epoch)
+            if not math.isnan(test_inf_rec):
+                writer.add_scalar("test/infected_recall", test_inf_rec, last_epoch)
     finally:
         if writer is not None:
             writer.close()
@@ -419,10 +445,10 @@ def main() -> None:
             if not args.no_class_weights
             else None
         ),
-        "best_val_infected_recall": best_val_inf_rec,
+        "best_val_infected_recall": _json_float(best_val_inf_rec),
         "test_loss": test_loss,
         "test_acc": test_acc,
-        "test_infected_recall": test_inf_rec,
+        "test_infected_recall": _json_float(test_inf_rec),
         "checkpoint": str(best_path.as_posix()),
         "tensorboard_dir": (
             str(tb_log_dir.resolve().as_posix()) if not args.no_tensorboard else None

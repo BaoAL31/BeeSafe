@@ -3,3 +3,6 @@ data/val/
 data/test/
 
 modeling/checkpoints/
+
+__pycache__/
+*.pyc

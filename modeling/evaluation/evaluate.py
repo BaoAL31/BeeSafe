@@ -21,7 +21,10 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import json
+import math
+import os
 import statistics
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -29,6 +32,13 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from torchvision import transforms
+
+try:
+    import psutil
+
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
 
 from mcunet.model_zoo import build_model as mcunet_build
 
@@ -65,12 +75,76 @@ def _cuda_peak_mb() -> Optional[float]:
 
 
 def _try_cpu_rss_mb() -> Optional[float]:
+    if not _HAS_PSUTIL:
+        return None
     try:
-        import os
-
-        import psutil
-
         return float(psutil.Process(os.getpid()).memory_info().rss / (1024**2))
+    except Exception:
+        return None
+
+
+class _ResourceMonitor:
+    """Background thread that samples CPU % and RSS at a fixed interval."""
+
+    def __init__(self, interval_s: float = 0.1) -> None:
+        self._interval = interval_s
+        self._peak_cpu_percent: float = 0.0
+        self._peak_rss_mb: float = 0.0
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if not _HAS_PSUTIL:
+            return
+        self._proc = psutil.Process(os.getpid())
+        self._proc.cpu_percent()  # prime the counter
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                cpu = self._proc.cpu_percent()
+                rss = self._proc.memory_info().rss / (1024**2)
+                if cpu > self._peak_cpu_percent:
+                    self._peak_cpu_percent = cpu
+                if rss > self._peak_rss_mb:
+                    self._peak_rss_mb = rss
+            except Exception:
+                pass
+            self._stop.wait(self._interval)
+
+    def stop(self) -> Dict[str, Optional[float]]:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        return {
+            "peak_cpu_percent": self._peak_cpu_percent if _HAS_PSUTIL else None,
+            "peak_rss_mb": self._peak_rss_mb if _HAS_PSUTIL else None,
+        }
+
+
+def _try_gpu_utilization() -> Optional[Dict[str, Any]]:
+    """Query current GPU utilization and memory via pynvml (if available)."""
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        name = pynvml.nvmlDeviceGetName(handle)
+        if isinstance(name, bytes):
+            name = name.decode()
+        pynvml.nvmlShutdown()
+        return {
+            "gpu_name": name,
+            "gpu_util_percent": util.gpu,
+            "gpu_mem_util_percent": util.memory,
+            "gpu_mem_used_mb": mem.used / (1024**2),
+            "gpu_mem_total_mb": mem.total / (1024**2),
+        }
     except Exception:
         return None
 
@@ -83,8 +157,8 @@ def measure_classification_latency_memory(
     max_timed_batches: Optional[int],
 ) -> Dict[str, Any]:
     """
-    Mean batch / per-image latency (ms) and peak CUDA memory during timed inference.
-    CUDA peak is reset after warmup so it reflects steady-state forward passes only.
+    Per-image latency (ms), peak CUDA memory, peak CPU %, peak RSS, and GPU
+    utilization during timed inference.
     """
     model.eval()
     batch_ms: List[float] = []
@@ -92,6 +166,9 @@ def measure_classification_latency_memory(
     n_warmup_done = 0
     n_timed = 0
     cuda_peak_reset = False
+
+    rss_before = _try_cpu_rss_mb()
+    monitor = _ResourceMonitor(interval_s=0.05)
 
     for _batch_idx, (images, _labels) in enumerate(loader):
         images = images.to(device)
@@ -109,6 +186,7 @@ def measure_classification_latency_memory(
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats()
                 _sync_if_cuda(device)
+            monitor.start()
             cuda_peak_reset = True
 
         _sync_if_cuda(device)
@@ -123,6 +201,10 @@ def measure_classification_latency_memory(
         per_image_ms.append(elapsed_ms / max(bs, 1))
         n_timed += 1
 
+    resource_stats = monitor.stop()
+    rss_after = _try_cpu_rss_mb()
+    gpu_info = _try_gpu_utilization() if device.type == "cuda" else None
+
     out: Dict[str, Any] = {
         "warmup_batches_run": n_warmup_done,
         "timed_batches": n_timed,
@@ -131,11 +213,12 @@ def measure_classification_latency_memory(
         "latency_ms_per_image_mean": statistics.mean(per_image_ms) if per_image_ms else None,
         "latency_ms_per_image_stdev": statistics.stdev(per_image_ms) if len(per_image_ms) > 1 else None,
         "peak_memory_cuda_mb": _cuda_peak_mb() if device.type == "cuda" and n_timed > 0 else None,
-        "process_rss_mb_before": None,
-        "process_rss_mb_after": None,
+        "process_rss_mb_before": rss_before,
+        "process_rss_mb_after": rss_after,
+        "peak_rss_mb": resource_stats.get("peak_rss_mb"),
+        "peak_cpu_percent": resource_stats.get("peak_cpu_percent"),
+        "gpu_utilization": gpu_info,
     }
-    if device.type != "cuda" and n_timed > 0:
-        out["process_rss_mb_after"] = _try_cpu_rss_mb()
     return out
 
 
@@ -153,6 +236,9 @@ def measure_localization_latency_memory(
     n_timed = 0
     cuda_peak_reset = False
 
+    rss_before = _try_cpu_rss_mb()
+    monitor = _ResourceMonitor(interval_s=0.05)
+
     for _batch_idx, (images, _targets) in enumerate(loader):
         images = [img.to(device) for img in images]
         if n_warmup_done < warmup_batches:
@@ -169,6 +255,7 @@ def measure_localization_latency_memory(
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats()
                 _sync_if_cuda(device)
+            monitor.start()
             cuda_peak_reset = True
 
         _sync_if_cuda(device)
@@ -183,6 +270,10 @@ def measure_localization_latency_memory(
         per_image_ms.append(elapsed_ms / max(bs, 1))
         n_timed += 1
 
+    resource_stats = monitor.stop()
+    rss_after = _try_cpu_rss_mb()
+    gpu_info = _try_gpu_utilization() if device.type == "cuda" else None
+
     out: Dict[str, Any] = {
         "warmup_batches_run": n_warmup_done,
         "timed_batches": n_timed,
@@ -191,12 +282,65 @@ def measure_localization_latency_memory(
         "latency_ms_per_image_mean": statistics.mean(per_image_ms) if per_image_ms else None,
         "latency_ms_per_image_stdev": statistics.stdev(per_image_ms) if len(per_image_ms) > 1 else None,
         "peak_memory_cuda_mb": _cuda_peak_mb() if device.type == "cuda" and n_timed > 0 else None,
-        "process_rss_mb_before": None,
-        "process_rss_mb_after": None,
+        "process_rss_mb_before": rss_before,
+        "process_rss_mb_after": rss_after,
+        "peak_rss_mb": resource_stats.get("peak_rss_mb"),
+        "peak_cpu_percent": resource_stats.get("peak_cpu_percent"),
+        "gpu_utilization": gpu_info,
     }
-    if device.type != "cuda" and n_timed > 0:
-        out["process_rss_mb_after"] = _try_cpu_rss_mb()
     return out
+
+
+def _print_resource_summary(lm: Dict[str, Any]) -> None:
+    """Pretty-print latency, memory, CPU and GPU stats from a measure_ result."""
+    lat_m = lm.get("latency_ms_per_image_mean")
+    lat_s = lm.get("latency_ms_per_image_stdev")
+    peak_cuda = lm.get("peak_memory_cuda_mb")
+    peak_rss = lm.get("peak_rss_mb")
+    rss_before = lm.get("process_rss_mb_before")
+    rss_after = lm.get("process_rss_mb_after")
+    peak_cpu = lm.get("peak_cpu_percent")
+    gpu = lm.get("gpu_utilization")
+
+    lines: List[str] = []
+    if lat_m is not None:
+        s = f"latency/img {lat_m:.3f} ms"
+        if lat_s is not None:
+            s += f" (±{lat_s:.3f})"
+        lines.append(s)
+
+    mem_parts: List[str] = []
+    if peak_cuda is not None:
+        mem_parts.append(f"peak CUDA alloc {peak_cuda:.1f} MB")
+    if peak_rss is not None:
+        mem_parts.append(f"peak RSS {peak_rss:.1f} MB")
+    elif rss_after is not None:
+        mem_parts.append(f"RSS {rss_after:.1f} MB (after)")
+    if rss_before is not None and rss_after is not None:
+        mem_parts.append(f"RSS delta {rss_after - rss_before:+.1f} MB")
+    if mem_parts:
+        lines.append(" | ".join(mem_parts))
+
+    cpu_gpu_parts: List[str] = []
+    if peak_cpu is not None:
+        cpu_gpu_parts.append(f"peak CPU {peak_cpu:.0f}%")
+    if gpu is not None:
+        name = gpu.get("gpu_name", "GPU")
+        util = gpu.get("gpu_util_percent")
+        mem_pct = gpu.get("gpu_mem_util_percent")
+        mem_used = gpu.get("gpu_mem_used_mb")
+        mem_total = gpu.get("gpu_mem_total_mb")
+        parts = [name]
+        if util is not None:
+            parts.append(f"util {util}%")
+        if mem_used is not None and mem_total is not None:
+            parts.append(f"VRAM {mem_used:.0f}/{mem_total:.0f} MB ({mem_pct}%)")
+        cpu_gpu_parts.append(" ".join(parts))
+    if cpu_gpu_parts:
+        lines.append(" | ".join(cpu_gpu_parts))
+
+    for line in lines:
+        print(f"  {line}")
 
 
 def eval_classification(args: argparse.Namespace) -> Dict[str, Any]:
@@ -256,12 +400,20 @@ def eval_classification(args: argparse.Namespace) -> Dict[str, Any]:
         "n_samples": len(ds),
         "loss": loss,
         "accuracy": acc,
-        "infected_recall": infected_recall,
+        "infected_recall": (
+            None if isinstance(infected_recall, float) and math.isnan(infected_recall)
+            else infected_recall
+        ),
     }
 
+    ir_s = (
+        "n/a"
+        if isinstance(infected_recall, float) and math.isnan(infected_recall)
+        else f"{infected_recall:.4f}"
+    )
     print(
         f"classification | {args.split} | n={len(ds)} | "
-        f"loss {loss:.4f} | acc {acc:.4f} | infected_recall {infected_recall:.4f}"
+        f"loss {loss:.4f} | acc {acc:.4f} | infected_recall {ir_s}"
     )
 
     if not getattr(args, "skip_latency_memory", False):
@@ -273,18 +425,7 @@ def eval_classification(args: argparse.Namespace) -> Dict[str, Any]:
             max_timed_batches=args.latency_max_batches,
         )
         metrics["latency_memory"] = lm
-        lat_m = lm.get("latency_ms_per_image_mean")
-        peak = lm.get("peak_memory_cuda_mb")
-        rss = lm.get("process_rss_mb_after")
-        extra = []
-        if lat_m is not None:
-            extra.append(f"latency/img ~{lat_m:.3f} ms")
-        if peak is not None:
-            extra.append(f"peak CUDA alloc {peak:.1f} MB")
-        elif rss is not None:
-            extra.append(f"RSS ~{rss:.1f} MB (after, psutil)")
-        if extra:
-            print("  " + " | ".join(extra))
+        _print_resource_summary(lm)
     else:
         metrics["latency_memory"] = None
     if args.output_json:
@@ -351,18 +492,7 @@ def eval_localization(args: argparse.Namespace) -> Dict[str, Any]:
             max_timed_batches=args.latency_max_batches,
         )
         metrics["latency_memory"] = lm
-        lat_m = lm.get("latency_ms_per_image_mean")
-        peak = lm.get("peak_memory_cuda_mb")
-        rss = lm.get("process_rss_mb_after")
-        extra = []
-        if lat_m is not None:
-            extra.append(f"latency/img ~{lat_m:.3f} ms")
-        if peak is not None:
-            extra.append(f"peak CUDA alloc {peak:.1f} MB")
-        elif rss is not None:
-            extra.append(f"RSS ~{rss:.1f} MB (after, psutil)")
-        if extra:
-            print("  " + " | ".join(extra))
+        _print_resource_summary(lm)
     else:
         metrics["latency_memory"] = None
     if args.output_json:
