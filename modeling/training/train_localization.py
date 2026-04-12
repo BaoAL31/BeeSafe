@@ -1,3 +1,11 @@
+"""
+BeeSafe bounding-box training: torchvision Faster R-CNN on Varroa-style `gt_one.csv` annotations.
+
+This is separate from the MCUNet repo's demo detection model (`person-det`, `eval_det.py`):
+that model is a compact person detector for TinyEngine demos; BeeSafe uses Faster R-CNN
+for bee / infection box supervision from your dataset splits.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -201,9 +209,14 @@ def eval_pos_recall(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Train Faster R-CNN (MobileNetV3) for bounding-box localization on BeeSafe "
+            "Train Faster R-CNN (MobileNetV3 FPN) for bounding-box localization on BeeSafe "
             "gt_one.csv splits."
-        )
+        ),
+        epilog=(
+            "MCUNet's own detection demo is net_id 'person-det' (see modeling/mcunet/eval_det.py). "
+            "This script trains PyTorch Faster R-CNN on BeeSafe labels, not that TFLite person model."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--epochs", type=int, default=15)
@@ -219,7 +232,9 @@ def main() -> None:
         default=True,
         help="Use torchvision COCO-pretrained Faster R-CNN weights.",
     )
-    parser.add_argument("--save-dir", type=Path, default=Path("checkpoints/localization"))
+    parser.add_argument(
+        "--save-dir", type=Path, default=Path("modeling/checkpoints/localization")
+    )
     parser.add_argument(
         "--no-loss-weights",
         action="store_true",

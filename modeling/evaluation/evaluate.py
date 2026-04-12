@@ -3,8 +3,8 @@ Evaluate trained BeeSafe checkpoints.
 
 Run from the repository root, for example:
 
-  python -m modeling.evaluation.evaluate classification --checkpoint checkpoints/mcunet/mcunet-320kB_best.pt
-  python -m modeling.evaluation.evaluate localization --checkpoint checkpoints/localization/localization_best.pt
+  python -m modeling.evaluation.evaluate classification --checkpoint modeling/checkpoints/mcunet/mcunet-in3_best.pt
+  python -m modeling.evaluation.evaluate localization --checkpoint modeling/checkpoints/localization/localization_best.pt
 
 Latency uses CUDA synchronize + perf_counter; peak memory uses torch.cuda.max_memory_allocated
 after warmup. CPU runs optionally report process RSS after inference if psutil is installed.
@@ -19,10 +19,6 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-
-from modeling.mcunet_patch import apply_mcunet_download_patch
-
-apply_mcunet_download_patch()
 
 import json
 import statistics
@@ -246,7 +242,9 @@ def eval_classification(args: argparse.Namespace) -> Dict[str, Any]:
 
     # Unweighted CE for a comparable scalar loss on held-out data
     criterion = nn.CrossEntropyLoss()
-    loss, acc = run_epoch(model, loader, criterion, None, device)
+    loss, acc, infected_recall = run_epoch(
+        model, loader, criterion, None, device, binary_infected
+    )
 
     metrics: Dict[str, Any] = {
         "task": "classification",
@@ -258,11 +256,12 @@ def eval_classification(args: argparse.Namespace) -> Dict[str, Any]:
         "n_samples": len(ds),
         "loss": loss,
         "accuracy": acc,
+        "infected_recall": infected_recall,
     }
 
     print(
         f"classification | {args.split} | n={len(ds)} | "
-        f"loss {loss:.4f} | acc {acc:.4f}"
+        f"loss {loss:.4f} | acc {acc:.4f} | infected_recall {infected_recall:.4f}"
     )
 
     if not getattr(args, "skip_latency_memory", False):

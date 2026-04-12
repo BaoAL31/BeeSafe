@@ -6,21 +6,16 @@ import sys
 from pathlib import Path
 from typing import Callable, Dict, List, Sequence, Tuple
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
-from modeling.mcunet_patch import apply_mcunet_download_patch
-
-apply_mcunet_download_patch()
-
 import torch
 from PIL import Image
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 
-from mcunet.model_zoo import build_model, net_id_list
+from mcunet.model_zoo import build_model, download_tflite, net_id_list
+
+from modeling.training.classification_metrics import infected_recall
 
 
 def parse_gt_line(line: str) -> Tuple[str, int]:
@@ -134,12 +129,15 @@ def run_epoch(
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer | None,
     device: torch.device,
-) -> Tuple[float, float]:
+    binary_infected: bool,
+) -> Tuple[float, float, float]:
     is_train = optimizer is not None
     model.train(is_train)
     total_loss = 0.0
     total_correct = 0
     total_count = 0
+    all_preds: List[torch.Tensor] = []
+    all_labels: List[torch.Tensor] = []
 
     for images, labels in loader:
         images = images.to(device)
@@ -153,18 +151,28 @@ def run_epoch(
             loss.backward()
             optimizer.step()
 
+        preds = logits.argmax(dim=1)
         total_loss += loss.item() * labels.size(0)
-        total_correct += (logits.argmax(dim=1) == labels).sum().item()
+        total_correct += (preds == labels).sum().item()
         total_count += labels.size(0)
+        all_preds.append(preds.detach().cpu())
+        all_labels.append(labels.detach().cpu())
 
     avg_loss = total_loss / max(total_count, 1)
     acc = total_correct / max(total_count, 1)
-    return avg_loss, acc
+    preds_cat = torch.cat(all_preds) if all_preds else torch.tensor([], dtype=torch.long)
+    labels_cat = torch.cat(all_labels) if all_labels else torch.tensor([], dtype=torch.long)
+    inf_rec = infected_recall(preds_cat, labels_cat, binary_infected)
+    return avg_loss, acc, inf_rec
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train MCUNet for BeeSafe image-level classification (healthy vs infected)."
+        description=(
+            "Train MCUNet for BeeSafe binary image-level classification (healthy vs infected; "
+            "raw labels 1 and 3 are combined as infected). "
+            "Checkpoints are selected by validation infected recall (catch all infected bees)."
+        )
     )
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument(
@@ -172,9 +180,8 @@ def main() -> None:
         type=str,
         default="mcunet-in3",
         help=(
-            "MCUNet zoo id (upstream names: mcunet-in0..in4, mbv2-w0.35, proxyless-w0.3, "
-            "mcunet-vww0..vww2, person-det). Default mcunet-in3 ≈ 320KB/1MB ImageNet profile. "
-            "Run with --list-net-ids to print ids for your installed mcunet."
+            "MCUNet zoo id (see --list-net-ids). Upstream clone uses mcunet-in0..in4, "
+            "mbv2-w0.35, proxyless-w0.3, mcunet-vww0..vww2, person-det. Default mcunet-in3 ≈ 320KB/1MB."
         ),
     )
     parser.add_argument(
@@ -187,7 +194,6 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--binary-infected", action="store_true")
     parser.add_argument(
         "--no-class-weights",
         action="store_true",
@@ -195,11 +201,38 @@ def main() -> None:
     )
     parser.add_argument("--pretrained", action="store_true")
     parser.add_argument(
+        "--download-tflite",
+        action="store_true",
+        help="After evaluation, download the matching .tflite from the MCUNet release (same net_id).",
+    )
+    parser.add_argument(
         "--save-dir",
         type=Path,
-        default=Path("checkpoints/mcunet"),
+        default=Path("modeling/checkpoints/mcunet"),
+    )
+    parser.add_argument(
+        "--no-tensorboard",
+        action="store_true",
+        help="Disable TensorBoard logging.",
+    )
+    parser.add_argument(
+        "--tensorboard-dir",
+        type=Path,
+        default=None,
+        help="TensorBoard log directory (default: <save-dir>/tensorboard).",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=0,
+        help=(
+            "Stop after this many epochs with no improvement in val infected recall "
+            "(0 = run all epochs)."
+        ),
     )
     args = parser.parse_args()
+    if args.early_stopping_patience < 0:
+        parser.error("--early-stopping-patience must be >= 0")
 
     if args.list_net_ids:
         print(net_id_list)
@@ -214,7 +247,8 @@ def main() -> None:
             raise FileNotFoundError(f"Missing split file: {csv_path}")
 
     model, image_size, _ = build_model(net_id=args.net_id, pretrained=args.pretrained)
-    num_classes = 2 if args.binary_infected else 3
+    # Always binary: healthy (0) vs infected; raw labels 1 and 3 map to class 1.
+    num_classes = 2
     replace_classifier_head(model, num_classes=num_classes)
 
     transform_train = transforms.Compose(
@@ -239,7 +273,7 @@ def main() -> None:
         ]
     )
 
-    label_mapper = make_label_mapper(args.binary_infected)
+    label_mapper = make_label_mapper(True)
     train_ds = BeeSafeDataset(train_csv, data_dir, transform_train, label_mapper)
     val_ds = BeeSafeDataset(val_csv, data_dir, transform_eval, label_mapper)
     test_ds = BeeSafeDataset(test_csv, data_dir, transform_eval, label_mapper)
@@ -267,19 +301,15 @@ def main() -> None:
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
     model = model.to(device)
 
     train_counts = count_class_frequencies(train_ds.samples, num_classes)
     if args.no_class_weights:
         criterion = nn.CrossEntropyLoss()
-        print("CrossEntropyLoss: uniform class weights (no reweighting).")
     else:
         ce_w = cross_entropy_class_weights(train_counts, device)
         criterion = nn.CrossEntropyLoss(weight=ce_w)
-        print(
-            "CrossEntropyLoss: inverse-frequency class weights "
-            f"(from train split counts {train_counts}): {ce_w.detach().cpu().tolist()}"
-        )
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -287,47 +317,101 @@ def main() -> None:
     )
 
     args.save_dir.mkdir(parents=True, exist_ok=True)
-    best_val_acc = -1.0
+    tb_log_dir = (
+        args.tensorboard_dir
+        if args.tensorboard_dir is not None
+        else args.save_dir / "tensorboard"
+    )
+    writer: SummaryWriter | None = None
+    if not args.no_tensorboard:
+        tb_log_dir.mkdir(parents=True, exist_ok=True)
+        writer = SummaryWriter(log_dir=str(tb_log_dir))
+        print(f"TensorBoard log dir: {tb_log_dir.resolve()}")
+
+    best_val_inf_rec = -1.0
     best_path = args.save_dir / f"{args.net_id}_best.pt"
+    epochs_without_improve = 0
+    last_epoch = 0
 
-    for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc = run_epoch(
-            model, train_loader, criterion, optimizer, device
+    try:
+        for epoch in range(1, args.epochs + 1):
+            last_epoch = epoch
+            train_loss, train_acc, train_inf_rec = run_epoch(
+                model,
+                train_loader,
+                criterion,
+                optimizer,
+                device,
+                True,
+            )
+            val_loss, val_acc, val_inf_rec = run_epoch(
+                model, val_loader, criterion, None, device, True
+            )
+            print(
+                f"Epoch {epoch:03d}/{args.epochs} | "
+                f"train loss {train_loss:.4f} acc {train_acc:.4f} inf_rec {train_inf_rec:.4f} | "
+                f"val loss {val_loss:.4f} acc {val_acc:.4f} inf_rec {val_inf_rec:.4f}"
+            )
+
+            if writer is not None:
+                writer.add_scalar("train/loss", train_loss, epoch)
+                writer.add_scalar("train/accuracy", train_acc, epoch)
+                writer.add_scalar("train/infected_recall", train_inf_rec, epoch)
+                writer.add_scalar("val/loss", val_loss, epoch)
+                writer.add_scalar("val/accuracy", val_acc, epoch)
+                writer.add_scalar("val/infected_recall", val_inf_rec, epoch)
+                writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch)
+
+            if val_inf_rec > best_val_inf_rec:
+                best_val_inf_rec = val_inf_rec
+                epochs_without_improve = 0
+                ckpt: Dict = {
+                    "model_state_dict": model.state_dict(),
+                    "net_id": args.net_id,
+                    "image_size": image_size,
+                    "num_classes": num_classes,
+                    "binary_infected": True,
+                    "best_val_infected_recall": best_val_inf_rec,
+                    "val_acc_at_best": val_acc,
+                    "train_class_counts": train_counts,
+                    "class_weights_enabled": not args.no_class_weights,
+                }
+                if not args.no_class_weights:
+                    ckpt["ce_class_weights"] = cross_entropy_class_weights(
+                        train_counts, torch.device("cpu")
+                    ).tolist()
+                torch.save(ckpt, best_path)
+                if writer is not None:
+                    writer.add_scalar("best/val_infected_recall", best_val_inf_rec, epoch)
+            else:
+                if args.early_stopping_patience > 0:
+                    epochs_without_improve += 1
+                    if epochs_without_improve >= args.early_stopping_patience:
+                        print(
+                            "Early stopping: no improvement in val infected recall for "
+                            f"{args.early_stopping_patience} epoch(s)."
+                        )
+                        break
+
+        checkpoint = torch.load(best_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        test_loss, test_acc, test_inf_rec = run_epoch(
+            model, test_loader, criterion, None, device, True
         )
-        val_loss, val_acc = run_epoch(model, val_loader, criterion, None, device)
-        print(
-            f"Epoch {epoch:03d}/{args.epochs} | "
-            f"train loss {train_loss:.4f} acc {train_acc:.4f} | "
-            f"val loss {val_loss:.4f} acc {val_acc:.4f}"
-        )
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            ckpt: Dict = {
-                "model_state_dict": model.state_dict(),
-                "net_id": args.net_id,
-                "image_size": image_size,
-                "num_classes": num_classes,
-                "binary_infected": args.binary_infected,
-                "best_val_acc": best_val_acc,
-                "train_class_counts": train_counts,
-                "class_weights_enabled": not args.no_class_weights,
-            }
-            if not args.no_class_weights:
-                ckpt["ce_class_weights"] = cross_entropy_class_weights(
-                    train_counts, torch.device("cpu")
-                ).tolist()
-            torch.save(ckpt, best_path)
-
-    checkpoint = torch.load(best_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    test_loss, test_acc = run_epoch(model, test_loader, criterion, None, device)
+        if writer is not None:
+            writer.add_scalar("test/loss", test_loss, last_epoch)
+            writer.add_scalar("test/accuracy", test_acc, last_epoch)
+            writer.add_scalar("test/infected_recall", test_inf_rec, last_epoch)
+    finally:
+        if writer is not None:
+            writer.close()
 
     metrics = {
         "net_id": args.net_id,
         "image_size": image_size,
         "num_classes": num_classes,
-        "binary_infected": args.binary_infected,
+        "binary_infected": True,
         "train_class_counts": train_counts,
         "class_weights_enabled": not args.no_class_weights,
         "ce_class_weights": (
@@ -335,15 +419,35 @@ def main() -> None:
             if not args.no_class_weights
             else None
         ),
-        "best_val_acc": best_val_acc,
+        "best_val_infected_recall": best_val_inf_rec,
         "test_loss": test_loss,
         "test_acc": test_acc,
+        "test_infected_recall": test_inf_rec,
         "checkpoint": str(best_path.as_posix()),
+        "tensorboard_dir": (
+            str(tb_log_dir.resolve().as_posix()) if not args.no_tensorboard else None
+        ),
+        "early_stopping_patience": args.early_stopping_patience,
+        "epochs_trained": last_epoch,
+        "stopped_early": last_epoch < args.epochs,
     }
+    if args.download_tflite:
+        tflite_path = download_tflite(net_id=args.net_id)
+        metrics["tflite_path"] = tflite_path
+        if tflite_path:
+            print(f"TFLite: {tflite_path}")
+        else:
+            print("TFLite download failed (see stderr above).", file=sys.stderr)
+
     metrics_path = args.save_dir / f"{args.net_id}_metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    print(f"Best checkpoint: {best_path}")
-    print(f"Test loss: {test_loss:.4f} | Test acc: {test_acc:.4f}")
+    if last_epoch < args.epochs:
+        print(f"Stopped after {last_epoch} epoch(s) (max {args.epochs}).")
+    print(f"Best checkpoint: {best_path} (val infected recall {best_val_inf_rec:.4f})")
+    print(
+        f"Test loss: {test_loss:.4f} | Test acc: {test_acc:.4f} | "
+        f"Test infected recall: {test_inf_rec:.4f}"
+    )
     print(f"Metrics: {metrics_path}")
 
 
