@@ -1,4 +1,4 @@
-# BeeSafe Modeling
+# BeeSafe
 
 Binary image-level classification: **healthy (0)** vs **infected (1)**.
 Raw CSV labels 1 and 3 (different Varroa infection markers) are combined into a
