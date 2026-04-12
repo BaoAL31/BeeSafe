@@ -585,8 +585,8 @@ def main() -> None:
     parser.add_argument(
         "--md-output",
         type=Path,
-        default=Path("data/data_summary.md"),
-        help="Where to write summary Markdown (default: data/data_summary.md)",
+        default=Path("data/summary/data_summary.md"),
+        help="Where to write summary Markdown (default: data/summary/data_summary.md)",
     )
     parser.add_argument(
         "--sample-images",

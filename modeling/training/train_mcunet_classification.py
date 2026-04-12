@@ -2,8 +2,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Callable, Dict, List, Sequence, Tuple
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from modeling.mcunet_patch import apply_mcunet_download_patch
+
+apply_mcunet_download_patch()
 
 import torch
 from PIL import Image
@@ -87,6 +96,38 @@ def replace_classifier_head(model: nn.Module, num_classes: int) -> None:
     raise RuntimeError("Could not find classifier layer to replace.")
 
 
+def count_class_frequencies(samples: Sequence[Tuple[Path, int]], num_classes: int) -> List[int]:
+    counts = [0] * num_classes
+    for _, y in samples:
+        counts[y] += 1
+    return counts
+
+
+def cross_entropy_class_weights(counts: List[int], device: torch.device) -> torch.Tensor:
+    """
+    Inverse-frequency weights for CrossEntropyLoss. For binary healthy vs infected,
+    healthy=1.0 and infected=n_healthy/n_infected (e.g. ~2.42 for 9562:3947).
+    For three classes, uses weight[c] = N / (C * n_c).
+    """
+    num_classes = len(counts)
+    total = sum(counts)
+    if total == 0:
+        return torch.ones(num_classes, device=device)
+
+    if num_classes == 2:
+        n0, n1 = counts[0], counts[1]
+        if n1 < 1:
+            w = torch.tensor([1.0, 1.0], dtype=torch.float32)
+        else:
+            w = torch.tensor([1.0, n0 / n1], dtype=torch.float32)
+    else:
+        w = torch.tensor(
+            [total / (num_classes * c) if c > 0 else 0.0 for c in counts],
+            dtype=torch.float32,
+        )
+    return w.to(device)
+
+
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -122,15 +163,28 @@ def run_epoch(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train MCUNet on BeeSafe.")
+    parser = argparse.ArgumentParser(
+        description="Train MCUNet for BeeSafe image-level classification (healthy vs infected)."
+    )
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
-    parser.add_argument("--net-id", type=str, default="mcunet-in2")
+    parser.add_argument(
+        "--net-id",
+        type=str,
+        default="mcunet-320kB",
+        help="MCUNet zoo id (e.g. mcunet-320kB, mcunet-5fps, mcunet-512kB, mbv2-320kB). "
+        "Run mcunet.model_zoo.NET_INFO or see mcunet docs for valid names.",
+    )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--binary-infected", action="store_true")
+    parser.add_argument(
+        "--no-class-weights",
+        action="store_true",
+        help="Disable inverse-frequency weights in CrossEntropyLoss (default: enabled).",
+    )
     parser.add_argument("--pretrained", action="store_true")
     parser.add_argument(
         "--save-dir",
@@ -202,7 +256,18 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-    criterion = nn.CrossEntropyLoss()
+
+    train_counts = count_class_frequencies(train_ds.samples, num_classes)
+    if args.no_class_weights:
+        criterion = nn.CrossEntropyLoss()
+        print("CrossEntropyLoss: uniform class weights (no reweighting).")
+    else:
+        ce_w = cross_entropy_class_weights(train_counts, device)
+        criterion = nn.CrossEntropyLoss(weight=ce_w)
+        print(
+            "CrossEntropyLoss: inverse-frequency class weights "
+            f"(from train split counts {train_counts}): {ce_w.detach().cpu().tolist()}"
+        )
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -226,17 +291,21 @@ def main() -> None:
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "net_id": args.net_id,
-                    "image_size": image_size,
-                    "num_classes": num_classes,
-                    "binary_infected": args.binary_infected,
-                    "best_val_acc": best_val_acc,
-                },
-                best_path,
-            )
+            ckpt: Dict = {
+                "model_state_dict": model.state_dict(),
+                "net_id": args.net_id,
+                "image_size": image_size,
+                "num_classes": num_classes,
+                "binary_infected": args.binary_infected,
+                "best_val_acc": best_val_acc,
+                "train_class_counts": train_counts,
+                "class_weights_enabled": not args.no_class_weights,
+            }
+            if not args.no_class_weights:
+                ckpt["ce_class_weights"] = cross_entropy_class_weights(
+                    train_counts, torch.device("cpu")
+                ).tolist()
+            torch.save(ckpt, best_path)
 
     checkpoint = torch.load(best_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -247,6 +316,13 @@ def main() -> None:
         "image_size": image_size,
         "num_classes": num_classes,
         "binary_infected": args.binary_infected,
+        "train_class_counts": train_counts,
+        "class_weights_enabled": not args.no_class_weights,
+        "ce_class_weights": (
+            cross_entropy_class_weights(train_counts, torch.device("cpu")).tolist()
+            if not args.no_class_weights
+            else None
+        ),
         "best_val_acc": best_val_acc,
         "test_loss": test_loss,
         "test_acc": test_acc,

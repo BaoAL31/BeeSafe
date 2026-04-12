@@ -101,6 +101,38 @@ def collate_fn(batch):
     return tuple(zip(*batch))
 
 
+def count_image_level_healthy_infected(csv_path: Path) -> Tuple[int, int]:
+    """Rows with label 0 vs non-zero (train split), for loss weighting."""
+    healthy = 0
+    infected = 0
+    for raw in csv_path.read_text(encoding="utf-8").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        parts = raw.split()
+        if len(parts) < 2:
+            continue
+        try:
+            lab = int(parts[1])
+        except ValueError:
+            continue
+        if lab == 0:
+            healthy += 1
+        else:
+            infected += 1
+    return healthy, infected
+
+
+def localization_classifier_loss_weight(healthy: int, infected: int) -> float:
+    """
+    Scale ROI classification loss when infected images are rarer than healthy
+    (same ratio idea as classification CE: weight ~ n_healthy / n_infected).
+    """
+    if infected < 1:
+        return 1.0
+    return float(healthy) / float(infected)
+
+
 def build_model(num_classes: int, pretrained: bool) -> torch.nn.Module:
     model = fasterrcnn_mobilenet_v3_large_320_fpn(weights="DEFAULT" if pretrained else None)
     in_features = model.roi_heads.box_predictor.cls_score.in_features
@@ -113,6 +145,7 @@ def train_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    loss_weights: Dict[str, float] | None,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -121,7 +154,10 @@ def train_epoch(
         images = [img.to(device) for img in images]
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
         losses: Dict[str, torch.Tensor] = model(images, targets)  # type: ignore[assignment]
-        loss = sum(losses.values())
+        if loss_weights:
+            loss = sum(loss_weights.get(k, 1.0) * v for k, v in losses.items())
+        else:
+            loss = sum(losses.values())
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
@@ -164,7 +200,10 @@ def eval_pos_recall(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train a bbox detector for infected spots using BeeSafe gt_one.csv splits."
+        description=(
+            "Train Faster R-CNN (MobileNetV3) for bounding-box localization on BeeSafe "
+            "gt_one.csv splits."
+        )
     )
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--epochs", type=int, default=15)
@@ -178,9 +217,14 @@ def main() -> None:
         "--pretrained",
         action="store_true",
         default=True,
-        help="Use torchvision COCO-pretrained detector weights.",
+        help="Use torchvision COCO-pretrained Faster R-CNN weights.",
     )
-    parser.add_argument("--save-dir", type=Path, default=Path("checkpoints/detector"))
+    parser.add_argument("--save-dir", type=Path, default=Path("checkpoints/localization"))
+    parser.add_argument(
+        "--no-loss-weights",
+        action="store_true",
+        help="Disable inverse-frequency weighting of loss_classifier (default: enabled).",
+    )
     args = parser.parse_args()
 
     data_dir = args.data_dir.resolve()
@@ -225,6 +269,18 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
+    n_healthy, n_infected = count_image_level_healthy_infected(train_csv)
+    if args.no_loss_weights:
+        loss_weights: Dict[str, float] | None = None
+        print("Training loss: uniform (no loss_classifier reweighting).")
+    else:
+        w_cls = localization_classifier_loss_weight(n_healthy, n_infected)
+        loss_weights = {"loss_classifier": w_cls}
+        print(
+            "Training loss: weighted (loss_classifier × "
+            f"{w_cls:.4f} from train rows healthy={n_healthy}, infected={n_infected})"
+        )
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -232,11 +288,11 @@ def main() -> None:
     )
 
     args.save_dir.mkdir(parents=True, exist_ok=True)
-    best_path = args.save_dir / "detector_best.pt"
+    best_path = args.save_dir / "localization_best.pt"
     best_val_recall = -1.0
 
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_epoch(model, train_loader, optimizer, device)
+        train_loss = train_epoch(model, train_loader, optimizer, device, loss_weights)
         val_recall = eval_pos_recall(
             model, val_loader, device, score_thresh=args.score_thresh
         )
@@ -254,6 +310,14 @@ def main() -> None:
                     "binary_labels": args.binary_labels,
                     "best_val_pos_recall": best_val_recall,
                     "score_thresh": args.score_thresh,
+                    "train_healthy_rows": n_healthy,
+                    "train_infected_rows": n_infected,
+                    "loss_weights_enabled": not args.no_loss_weights,
+                    "loss_classifier_weight": (
+                        localization_classifier_loss_weight(n_healthy, n_infected)
+                        if not args.no_loss_weights
+                        else None
+                    ),
                 },
                 best_path,
             )
@@ -269,9 +333,17 @@ def main() -> None:
         "score_thresh": args.score_thresh,
         "num_classes": num_classes,
         "binary_labels": args.binary_labels,
+        "train_healthy_rows": n_healthy,
+        "train_infected_rows": n_infected,
+        "loss_weights_enabled": not args.no_loss_weights,
+        "loss_classifier_weight": (
+            localization_classifier_loss_weight(n_healthy, n_infected)
+            if not args.no_loss_weights
+            else None
+        ),
         "checkpoint": str(best_path.as_posix()),
     }
-    metrics_path = args.save_dir / "detector_metrics.json"
+    metrics_path = args.save_dir / "localization_metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
     print(f"Best checkpoint: {best_path}")
