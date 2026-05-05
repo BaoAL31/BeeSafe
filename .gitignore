@@ -1,6 +1,7 @@
 data/train/
 data/val/
 data/test/
+data_yolo_cls/
 
 modeling/checkpoints/
 
