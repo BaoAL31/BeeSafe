@@ -1,1 +1,5 @@
-"""BeeSafe modeling: training and evaluation entry points."""
+"""Multimodal BeeSafe Package"""
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).parent.parent))

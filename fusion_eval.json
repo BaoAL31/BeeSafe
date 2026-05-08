@@ -1,0 +1,11 @@
+{
+  "task": "fusion",
+  "acoustic_checkpoint": "C:/Users/jembo/UTS/BeeSafe/modeling/checkpoints/acoustic/mcunet_acoustic_best.pt",
+  "visual_checkpoint": "C:/Users/jembo/UTS/BeeSafe/modeling/checkpoints/mcunet/mcunet-in3_best.pt",
+  "config": "C:/Users/jembo/UTS/BeeSafe/config.yaml",
+  "n_samples": 100,
+  "fusion_state_accuracy": 0.0,
+  "health_score_mae": 0.34419059842824934,
+  "health_score_mse": 0.16950317680688493,
+  "health_score_corr": 0.3075226870404534
+}

@@ -133,6 +133,16 @@ python -m tensorboard --logdir modeling/checkpoints/mcunet/tensorboard
 
 Open http://localhost:6006 in a browser.
 
+### Risks and mitigations
+
+| Risk | Mitigation |
+|------|------------|
+| Class imbalance | Apply weighted loss (healthy: 1.0, infected: 2.42) |
+| Single controlled source | Augmentation pipeline: Gaussian blur, brightness jitter, horizontal flip, random rotation |
+| Overfitting to Zenodo distribution | Dropout, early stopping, high batch size |
+| Metric misalignment | Use infected class recall as primary stopping criterion |
+| Model too heavy for real-time Jetson inference | Use small architectures/frameworks like YOLOv8n or MobileNetV3; benchmark latency and peak memory on device |
+
 ### GPU
 
 Training automatically uses CUDA if available (`torch.cuda.is_available()`).

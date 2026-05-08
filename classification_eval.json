@@ -1,0 +1,26 @@
+{
+  "task": "classification",
+  "checkpoint": "C:/Users/jembo/UTS/BeeSafe/modeling/checkpoints/mcunet/mcunet-in3_best.pt",
+  "split": "test",
+  "net_id": "mcunet-in3",
+  "num_classes": 2,
+  "binary_infected": true,
+  "n_samples": 3408,
+  "loss": 0.6102043074061613,
+  "accuracy": 0.7907863849765259,
+  "infected_recall": 0.9596602972399151,
+  "latency_memory": {
+    "warmup_batches_run": 2,
+    "timed_batches": 52,
+    "latency_ms_per_batch_mean": 57.950615384750286,
+    "latency_ms_per_batch_stdev": 4.894623774500199,
+    "latency_ms_per_image_mean": 0.9267403245215834,
+    "latency_ms_per_image_stdev": 0.07795031127195194,
+    "throughput_images_per_sec_mean": 1079.0509202415853,
+    "peak_memory_cuda_mb": 157.056640625,
+    "process_rss_mb_before": 1379.6875,
+    "process_rss_mb_after": 1386.87890625,
+    "peak_rss_mb": 1408.8828125,
+    "gpu_memory": null
+  }
+}

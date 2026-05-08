@@ -1,0 +1,96 @@
+# BeeSafe Multimodal Configuration
+# Late-fusion system combining acoustic and visual branches (both MCUNet)
+
+# Acoustic branch settings
+acoustic:
+  # Mel spectrogram parameters
+  sr: 16000  # Sample rate (Hz)
+  n_mels: 64  # Number of mel bands
+  n_time: 32  # Time frames (2-second clip at hop_length=512)
+  segment_duration: 2.0  # seconds
+  n_fft: 2048
+  hop_length: 512
+
+  # Model settings
+  net_id: "mcunet-in3"  # MCUNet variant (must match visual branch capability)
+  num_classes: 2
+  class_names: ["normal", "abnormal"]  # normal=queenright/healthy, abnormal=queenless/stressed
+
+  # Training settings
+  audio_dir: "data/zenodo_bee_audio"
+  batch_size: 64
+  epochs: 30
+  lr: 0.001
+  weight_decay: 0.0001
+  num_workers: 2
+  val_ratio: 0.15
+  test_ratio: 0.15
+  seed: 42
+  early_stopping_patience: 5
+
+  # Checkpoint settings
+  save_dir: "modeling/checkpoints/acoustic"
+  checkpoint_name: "mcunet_acoustic_best.pt"
+
+# Visual branch settings
+visual:
+  # Model settings
+  net_id: "mcunet-in3"  # MCUNet variant
+  num_classes: 2
+  class_names: ["Varroa-negative", "Varroa-positive"]
+  image_size: 96  # Input image size for MCUNet
+
+  # Training settings
+  data_dir: "data"
+  batch_size: 64
+  epochs: 10
+  lr: 0.001
+  weight_decay: 0.0001
+  num_workers: 2
+  pretrained: true
+
+  # Checkpoint settings
+  save_dir: "modeling/checkpoints/mcunet"
+  checkpoint_name: "mcunet-in3_best.pt"
+
+# Fusion engine settings
+fusion:
+  # Decision mapping table
+  mapping:
+    - [normal, Varroa-negative, "Healthy"]
+    - [normal, Varroa-positive, "Varroa Infestation (early)"]
+    - [abnormal, Varroa-negative, "Queenless / Stressed"]
+    - [abnormal, Varroa-positive, "Critical: Varroa + Stress"]
+
+  # Confidence thresholds (optional)
+  min_confidence: 0.5
+
+  # Health score calculation (1.0 = healthy, 0.0 = critical)
+  health_score_weights:
+    acoustic: 0.5
+    visual: 0.5
+
+# Deployment settings (Jetson)
+deployment:
+  # Audio capture
+  audio:
+    sample_rate: 16000
+    window_size: 2.0  # seconds
+    overlap: 0.5  # 50% overlap
+
+  # Camera trigger
+  camera:
+    trigger_on_abnormal: true
+    fixed_interval_seconds: 300  # 5 minutes
+    image_size: [96, 96]
+
+  # Logging
+  log_file: "logs/hive_health_log.json"
+  log_interval_seconds: 60
+
+# Paths
+paths:
+  acoustic_checkpoint: "modeling/checkpoints/acoustic/mcunet_acoustic_best.pt"
+  visual_checkpoint: "modeling/checkpoints/mcunet/mcunet-in3_best.pt"
+  acoustic_metrics: "modeling/checkpoints/acoustic/mcunet_acoustic_metrics.json"
+  visual_metrics: "modeling/checkpoints/mcunet/mcunet-in3_metrics.json"

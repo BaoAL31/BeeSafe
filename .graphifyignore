@@ -1,0 +1,7 @@
+data/
+*.csv
+*.npy
+*.npz
+*.h5
+*.parquet
+*.pkl

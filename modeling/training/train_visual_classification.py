@@ -182,7 +182,7 @@ def run_epoch(
     print(
         f"  [{phase}] labels: 0={n_label_0} 1={n_label_1} | "
         f"preds: 0={n_pred_0} 1={n_pred_1} | "
-        f"TP={tp} FN={fn} → recall={inf_rec:.4f}"
+        f"TP={tp} FN={fn} -> recall={inf_rec:.4f}"
     )
 
     return avg_loss, acc, inf_rec
@@ -230,7 +230,7 @@ def main() -> None:
     parser.add_argument(
         "--save-dir",
         type=Path,
-        default=Path("modeling/checkpoints/mcunet"),
+        default=Path("modeling/checkpoints/visual"),
     )
     parser.add_argument(
         "--no-tensorboard",

@@ -1,8 +1,20 @@
 data/train/
 data/val/
 data/test/
+zenodo_bee_audio/
+zenodo_bee_audio_test/
+data/download_zenodo_bee_audio.py
+data/gt.csv
 
+.agents/
+.cursor/
+.obsidian/
+.opencode/
+
+AGENTS.md
+obsidian/
 modeling/checkpoints/
+graphify-out/
 
 __pycache__/
 *.pyc
