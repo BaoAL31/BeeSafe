@@ -5,6 +5,7 @@ zenodo_bee_audio/
 zenodo_bee_audio_test/
 data/download_zenodo_bee_audio.py
 data/gt.csv
+data_yolo_cls/
 
 .agents/
 .cursor/
