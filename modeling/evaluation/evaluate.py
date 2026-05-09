@@ -824,7 +824,6 @@ def main() -> None:
 
         ac_ckpt = Path(args.acoustic_checkpoint).resolve()
         vis_ckpt = Path(args.visual_checkpoint).resolve()
-        config = Path(args.config).resolve()
         audio_dir = Path(args.audio_dir).resolve()
         image_data_dir = Path(args.image_data_dir).resolve()
 
@@ -837,10 +836,10 @@ def main() -> None:
         cls_args.split = args.split
         cls_args.batch_size = args.batch_size
         cls_args.num_workers = args.num_workers
-        cls_args.skip_latency_memory = True
+        cls_args.skip_latency_memory = args.skip_latency_memory
         cls_args.output_json = None
-        cls_args.latency_warmup = 2
-        cls_args.latency_max_batches = None
+        cls_args.latency_warmup = args.latency_warmup
+        cls_args.latency_max_batches = args.latency_max_batches
 
         print("=== Running classification ===")
         eval_classification(cls_args)
@@ -850,10 +849,10 @@ def main() -> None:
         aud_args.audio_dir = audio_dir
         aud_args.batch_size = args.batch_size
         aud_args.num_workers = args.num_workers
-        aud_args.skip_latency_memory = True
+        aud_args.skip_latency_memory = args.skip_latency_memory
         aud_args.output_json = None
-        aud_args.latency_warmup = 2
-        aud_args.latency_max_batches = None
+        aud_args.latency_warmup = args.latency_warmup
+        aud_args.latency_max_batches = args.latency_max_batches
 
         print("\n=== Running acoustic ===")
         eval_acoustic(aud_args)
@@ -875,6 +874,23 @@ def main() -> None:
     p_all.add_argument("--batch-size", type=int, default=32)
     p_all.add_argument("--num-workers", type=int, default=2)
     p_all.add_argument("--output-json", type=Path, default=None)
+    p_all.add_argument(
+        "--skip-latency-memory",
+        action="store_true",
+        help="Skip per-batch latency and peak memory measurement.",
+    )
+    p_all.add_argument(
+        "--latency-warmup",
+        type=int,
+        default=2,
+        help="Batches to run before timing (default: 2).",
+    )
+    p_all.add_argument(
+        "--latency-max-batches",
+        type=int,
+        default=None,
+        help="Max batches to time (default: all batches after warmup).",
+    )
     p_all.set_defaults(func=eval_all)
 
     args = parser.parse_args()

@@ -54,6 +54,17 @@ unzip val.zip -d data/
 unzip test.zip -d data/
 ```
 
+### Download audio dataset (optional)
+
+For acoustic model training, download the Zenodo beehive audio dataset:
+
+```bash
+# From the repository root
+python data/download_zenodo_bee_audio.py --output-dir data/zenodo_bee_audio
+```
+
+This downloads ~3.7 GB of annotated beehive audio recordings with QueenBee/NO_QueenBee labels.
+
 ### Data layout
 
 After extraction, the scripts expect the following under `data/` (configurable
@@ -67,21 +78,31 @@ data/
   test/gt_one.csv
   train/videos/...    # images referenced by gt_one.csv
   val/videos/...
-  test/videos/...
+  test/videos/
 ```
 
 Each line in `gt_one.csv`: `<relative_image_path> <label>` (label 0 = healthy,
 1 or 3 = infected).
 
+For audio data (if downloaded):
+```
+data/
+  zenodo_bee_audio/
+    *.wav             # audio files with labels in filename
+    *.lab             # optional label files
+```
+
 ---
 
 ## Training
+
+### Visual Model Training
 
 ```bash
 python -m modeling.training.train_mcunet_classification [OPTIONS]
 ```
 
-### Key arguments
+#### Key arguments
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -99,7 +120,7 @@ python -m modeling.training.train_mcunet_classification [OPTIONS]
 | `--tensorboard-dir` | `<save-dir>/tensorboard` | Override TensorBoard log directory |
 | `--download-tflite` | off | Download matching `.tflite` from MCUNet release after training |
 
-### Example
+#### Example
 
 ```bash
 python -m modeling.training.train_mcunet_classification \
@@ -109,13 +130,13 @@ python -m modeling.training.train_mcunet_classification \
     --pretrained
 ```
 
-### What it produces
+#### What it produces
 
 - `modeling/checkpoints/mcunet/<net-id>_best.pt` — best checkpoint (by val infected recall)
 - `modeling/checkpoints/mcunet/<net-id>_metrics.json` — training summary (metrics, hyperparams, paths)
 - `modeling/checkpoints/mcunet/tensorboard/` — TensorBoard event files
 
-### Metrics logged
+#### Metrics logged
 
 Per epoch (console + TensorBoard):
 
@@ -125,7 +146,7 @@ Per epoch (console + TensorBoard):
 After training, the best checkpoint is evaluated on the **test split** and
 results are saved to the metrics JSON.
 
-### TensorBoard
+#### TensorBoard
 
 ```bash
 python -m tensorboard --logdir modeling/checkpoints/mcunet/tensorboard
@@ -133,7 +154,7 @@ python -m tensorboard --logdir modeling/checkpoints/mcunet/tensorboard
 
 Open http://localhost:6006 in a browser.
 
-### Risks and mitigations
+#### Risks and mitigations
 
 | Risk | Mitigation |
 |------|------------|
@@ -143,7 +164,7 @@ Open http://localhost:6006 in a browser.
 | Metric misalignment | Use infected class recall as primary stopping criterion |
 | Model too heavy for real-time Jetson inference | Use small architectures/frameworks like YOLOv8n or MobileNetV3; benchmark latency and peak memory on device |
 
-### GPU
+#### GPU
 
 Training automatically uses CUDA if available (`torch.cuda.is_available()`).
 No extra flag is needed. Verify with:
@@ -151,6 +172,69 @@ No extra flag is needed. Verify with:
 ```bash
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu')"
 ```
+
+### Acoustic Model Training
+
+```bash
+python -m modeling.training.train_acoustic [OPTIONS]
+```
+
+Trains MCUNet on mel-spectrograms extracted from beehive audio for normal vs abnormal classification.
+
+#### Key arguments
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--audio-dir` | `data/zenodo_bee_audio` | Directory containing audio files |
+| `--sr` | `16000` | Sample rate for audio processing |
+| `--n-mels` | `64` | Number of mel bands for spectrogram |
+| `--n-fft` | `2048` | FFT size for spectrogram |
+| `--hop-length` | `512` | Hop length for spectrogram |
+| `--segment-duration` | `2.0` | Duration of audio segments (seconds) |
+| `--net-id` | `mcunet-in3` | MCUNet model ID from model zoo |
+| `--epochs` | `30` | Maximum training epochs |
+| `--batch-size` | `64` | Batch size for train and eval |
+| `--lr` | `1e-3` | Learning rate (AdamW) |
+| `--weight-decay` | `1e-4` | AdamW weight decay |
+| `--num-workers` | `2` | Number of data loading workers |
+| `--no-class-weights` | off | Disable inverse-frequency CE weights |
+| `--save-dir` | `modeling/checkpoints/acoustic` | Where to save best checkpoint and metrics |
+| `--no-tensorboard` | off | Disable TensorBoard logging |
+| `--early-stopping-patience` | `5` | Stop after N epochs without val metric improvement |
+| `--val-ratio` | `0.15` | Fraction of files for validation |
+| `--test-ratio` | `0.15` | Fraction of files for test |
+| `--seed` | `42` | Random seed for reproducibility |
+
+#### Example
+
+```bash
+python -m modeling.training.train_acoustic \
+    --epochs 50 \
+    --lr 1e-3 \
+    --early-stopping-patience 5 \
+    --audio-dir data/zenodo_bee_audio
+```
+
+#### What it produces
+
+- `modeling/checkpoints/acoustic/mcunet_acoustic_best.pt` — best checkpoint (by val abnormal recall)
+- `modeling/checkpoints/acoustic/mcunet_acoustic_metrics.json` — training summary
+- `modeling/checkpoints/acoustic/tensorboard/` — TensorBoard event files (if enabled)
+
+#### Metrics logged
+
+Per epoch (console + TensorBoard):
+
+- **loss**, **accuracy**, **abnormal recall** (TP / (TP + FN) on abnormal class)
+- Checkpoint saved when val abnormal recall improves
+
+After training, the best checkpoint is evaluated on the **test split** and
+results are saved to the metrics JSON.
+
+#### GPU
+
+Training automatically uses CUDA if available (`torch.cuda.is_available()`).
+No extra flag is needed.
 
 ---
 
@@ -228,3 +312,16 @@ classification | test | n=3408 | loss 0.3412 | acc 0.8750 | infected_recall 0.92
   peak CUDA alloc 48.2 MB | peak RSS 1204.3 MB | RSS delta +12.1 MB
   peak CPU 78% | NVIDIA GeForce RTX 3060 util 45% VRAM 1024/12288 MB (8%)
 ```
+
+---
+
+## Fusion Logic Example
+
+The following table shows how the acoustic and visual model outputs are fused to determine the final hive state:
+
+| Acoustic model output | Visual model output | Final hive state (fusion) |
+|-----------------------|---------------------|---------------------------|
+| normal                | Varroa‑negative     | Healthy                   |
+| normal                | Varroa‑positive     | Varroa Infestation (early)|
+| abnormal              | Varroa‑negative     | Queenless / Stressed      |
+| abnormal              | Varroa‑positive     | Critical: Varroa + Stress |
